@@ -720,6 +720,18 @@ If no native session reference is stored, the field is omitted.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
+`PaneInfo` also exposes an optional `foreground_process` object for the job in the pane's foreground. `name` is the job leader's executable basename with a login shell's leading `-` removed, `argv` holds at most 16 leading arguments of at most 256 bytes each, and `is_shell` is true when the pane's own shell is in the foreground, i.e. at a prompt. Herdr emits `pane.updated` when any of these change. The field is omitted when Herdr has not inspected the pane's foreground job.
+
+```json
+{
+  "foreground_process": {
+    "name": "htop",
+    "argv": ["htop", "-d", "5"],
+    "is_shell": false
+  }
+}
+```
+
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
@@ -826,6 +838,7 @@ Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, 
 to this server. It does not move other clients' views, and its payload does not
 identify the client. Selecting an already-selected pane does not emit it again.
 Terminal-title changes can emit `pane.updated`, but spinner-only raw-title changes do not emit it when `terminal_title_stripped` is unchanged.
+Changes to `foreground_process` also emit `pane.updated`.
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.

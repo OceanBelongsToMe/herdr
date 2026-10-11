@@ -580,6 +580,18 @@ Herdr に保存されたネイティブセッション参照があるとき、`p
 
 `pane.get`、`pane.list`、`agent.get`、`agent.list` は、ペインの PTY を現在制御しているプロセスの cwd を解決できるときに `foreground_cwd` も公開します。既存の `cwd` フィールドは、ラベル、follow-cwd 挙動、復元されたセッション状態に使われるペイン/ワークスペースの cwd のままです。
 
+`PaneInfo` は、ペインのフォアグラウンドジョブを表す任意の `foreground_process` オブジェクトも公開します。`name` はジョブリーダーの実行ファイル名 (ログインシェルの先頭の `-` を除いたもの)、`argv` は先頭から最大 16 個、各 256 バイトまでの引数、`is_shell` はペイン自身のシェルがフォアグラウンドにある (プロンプトを表示している) ときに true です。いずれかが変わると Herdr は `pane.updated` を発行します。Herdr がペインのフォアグラウンドジョブをまだ調べていない場合、このフィールドは省略されます。
+
+```json
+{
+  "foreground_process": {
+    "name": "htop",
+    "argv": ["htop", "-d", "5"],
+    "is_shell": false
+  }
+}
+```
+
 `PaneInfo` と `AgentInfo` は、任意の `terminal_title` と `terminal_title_stripped` フィールドを公開します。`terminal_title` は、安全性のための正規化を行った最新の OSC 0/2 タイトルです。`terminal_title_stripped` は、先頭にある認識済みのアクティビティまたはスピナーのグリフ 1 つと、それに続く空白を除去します。これらはサーバーが所有する値で、コールドリスタートをまたいで保持されず、メタデータの `title` や意味的なエージェント状態から独立しています。
 
 ユーザーフックが Herdr インテグレーションからライフサイクル状態を奪わずに表示をカスタマイズしたいときは `pane.report_metadata` を使ってください。
@@ -656,7 +668,7 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。
-ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
+ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`foreground_process` が変わったときも `pane.updated` を発行します。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
 レイアウトのイベント購読には `layout.updated` があります。このイベントは 1 つのタブについて更新済みの `PaneLayoutSnapshot` を運びます。`session.snapshot` でキャッシュを管理するクライアントは、このイベントを契機にサーバーから対象のレイアウトを再取得してください。遅れて届いたペイロードは、最新のスナップショットより古い可能性があります。
 
 worktree のイベント購読には `worktree.created`、`worktree.opened`、`worktree.removed` があります。worktree イベントは Git チェックアウトのライフサイクルを記述します。`worktree.created` は開かれた `workspace` と作成された `worktree` を含みます。`worktree.opened` は対象の `workspace`、開かれた `worktree`、`already_open` を含みます。`worktree.removed` は `workspace_id`、削除された `worktree`、`forced` を含みます。

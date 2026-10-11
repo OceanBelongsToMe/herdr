@@ -736,6 +736,7 @@ mod tests {
             focused: true,
             cwd: None,
             foreground_cwd: None,
+            foreground_process: None,
             restore_error: None,
             label: None,
             agent: None,

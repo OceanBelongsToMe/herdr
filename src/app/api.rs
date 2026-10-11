@@ -46,7 +46,7 @@ impl App {
                 self.handle_api_worktree_read_finished(*result);
                 changes_workspace
             }
-            ev @ AppEvent::TerminalBell { .. } => {
+            ev @ (AppEvent::TerminalBell { .. } | AppEvent::ForegroundProcessChanged { .. }) => {
                 self.handle_internal_event(ev);
                 false
             }
@@ -120,6 +120,11 @@ impl App {
         } = ev
         {
             self.handle_git_status_refreshed(results, cache_updates);
+            return Vec::new();
+        }
+
+        if let AppEvent::ForegroundProcessChanged { pane_id, process } = ev {
+            self.sync_foreground_process(pane_id, process);
             return Vec::new();
         }
 

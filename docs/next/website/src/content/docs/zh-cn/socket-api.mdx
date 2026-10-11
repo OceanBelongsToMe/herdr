@@ -576,6 +576,18 @@ Herdr 存有原生会话引用时,`pane.get`、`pane.list`、`agent.get` 和 `ag
 
 当 Herdr 能解析当前控制窗格 PTY 的进程的 cwd 时,`pane.get`、`pane.list`、`agent.get` 和 `agent.list` 也暴露 `foreground_cwd`。已有的 `cwd` 字段仍然是用于标签、follow-cwd 行为和恢复会话状态的窗格/工作区 cwd。
 
+`PaneInfo` 还暴露可选的 `foreground_process` 对象,描述窗格前台的作业。`name` 是作业首进程的可执行文件名(去掉登录 shell 开头的 `-`),`argv` 最多包含开头的 16 个参数,每个最多 256 字节,`is_shell` 在窗格自己的 shell 位于前台(即处于提示符)时为 true。任一值变化时 Herdr 会发出 `pane.updated`。Herdr 尚未检查窗格前台作业时,该字段被省略。
+
+```json
+{
+  "foreground_process": {
+    "name": "htop",
+    "argv": ["htop", "-d", "5"],
+    "is_shell": false
+  }
+}
+```
+
 `PaneInfo` 和 `AgentInfo` 暴露可选的 `terminal_title` 和 `terminal_title_stripped` 字段。`terminal_title` 是经过安全规范化的最新 OSC 0/2 标题。`terminal_title_stripped` 会移除开头一个已识别的活动或旋转指示符字形及其后的空白。这些值归服务器所有,冷重启后不会保留,并且独立于元数据 `title` 和语义智能体状态。
 
 当用户钩子想自定义展示、又不从 Herdr 集成接管生命周期状态时,使用 `pane.report_metadata`。
@@ -650,7 +662,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 
 工作区事件订阅包括 `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed` 和 `workspace.focused`。`workspace.metadata_updated` 报告令牌变更和 TTL 到期,但不会调用插件事件钩子。其他工作区事件描述 Herdr UI/运行时的生命周期。当工作区属于 worktree 组时,`workspace.created` 包含可选的 `workspace.worktree` 来源信息。`workspace.moved` 包含被移动的 `workspace_id`、请求的 `insert_index` 和更新后的有序 `workspaces` 列表。`workspace.reordered` 包含原子移动的 `workspace_ids`、可选的 `before_workspace_id` 和服务器确认的有序 `workspaces` 列表。在移除前 Herdr 仍能识别时,`workspace.closed` 包含最终的 `workspace` 快照。
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。
-窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed` 和 `pane.scroll_changed`。`pane.focused` 也会上报任意连接到此服务器的客户端手动选择窗格的变化，不会移动其他客户端的视图，且载荷不包含客户端身份。重复选择已选中的窗格不会再次发出事件。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。
+窗格事件订阅包括 `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed` 和 `pane.scroll_changed`。`pane.focused` 也会上报任意连接到此服务器的客户端手动选择窗格的变化，不会移动其他客户端的视图，且载荷不包含客户端身份。重复选择已选中的窗格不会再次发出事件。终端标题变化可能发出 `pane.updated`,但如果原始标题只有旋转指示符发生变化且 `terminal_title_stripped` 不变,则不会发出。`foreground_process` 变化时也会发出 `pane.updated`。`pane.scroll_changed` 只针对一个 `pane_id`,每当 Herdr 观察到滚动快照变化时,都会发出 `pane_id`、`workspace_id` 和当前 `scroll` 指标。
 布局事件订阅包括 `layout.updated`。该事件携带一个标签页更新后的 `PaneLayoutSnapshot`。使用 `session.snapshot` 维护缓存的客户端应将该事件作为重新读取受影响布局的通知；延迟到达的载荷可能早于最新快照。
 
 Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree.removed`。Worktree 事件描述 Git 检出的生命周期。`worktree.created` 包含打开的 `workspace` 和创建的 `worktree`。`worktree.opened` 包含目标 `workspace`、打开的 `worktree` 和 `already_open`。`worktree.removed` 包含 `workspace_id`、被移除的 `worktree` 和 `forced`。

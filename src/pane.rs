@@ -663,6 +663,7 @@ struct ProcessProbeResult {
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
     process_name: Option<String>,
+    foreground_process: Option<crate::api::schema::ForegroundProcessInfo>,
 }
 
 fn agent_hint_for_foreground_job_members(
@@ -708,6 +709,7 @@ fn process_probe_result(
         foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
         process_name: Some(process_name),
+        foreground_process: foreground_process_info(job, pid),
     }
 }
 
@@ -769,6 +771,7 @@ fn probe_foreground_process_from_jobs(
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
             process_name: identified.map(|(_, process_name)| process_name),
+            foreground_process: foreground_process_info(job, pid),
         };
     }
 
@@ -777,6 +780,68 @@ fn probe_foreground_process_from_jobs(
         foreground_is_pane_shell: false,
         agent: None,
         process_name: None,
+        foreground_process: None,
+    }
+}
+
+const FOREGROUND_PROCESS_MAX_ARGS: usize = 16;
+const FOREGROUND_PROCESS_MAX_ARG_BYTES: usize = 256;
+
+fn foreground_process_info(
+    job: &crate::platform::ForegroundJob,
+    shell_pid: u32,
+) -> Option<crate::api::schema::ForegroundProcessInfo> {
+    let process = job
+        .processes
+        .iter()
+        .find(|process| process.pid == job.process_group_id)
+        .or_else(|| job.processes.first())?;
+    let argv = process.argv.as_deref().unwrap_or_default();
+    Some(crate::api::schema::ForegroundProcessInfo {
+        name: foreground_process_name(process),
+        argv: argv
+            .iter()
+            .take(FOREGROUND_PROCESS_MAX_ARGS)
+            .map(|arg| arg[..arg.floor_char_boundary(FOREGROUND_PROCESS_MAX_ARG_BYTES)].to_string())
+            .collect(),
+        is_shell: job.processes.iter().any(|process| process.pid == shell_pid),
+    })
+}
+
+// Linux reports no argv0 and truncates the process name, so argv[0] comes next.
+fn foreground_process_name(process: &crate::platform::ForegroundProcess) -> String {
+    let argv0 = process.argv.as_ref().and_then(|argv| argv.first());
+    [process.argv0.as_deref(), argv0.map(String::as_str)]
+        .into_iter()
+        .flatten()
+        .chain(std::iter::once(process.name.as_str()))
+        .find_map(|raw| {
+            let base = std::path::Path::new(raw).file_name()?.to_str()?;
+            let base = base.strip_prefix('-').unwrap_or(base);
+            (!base.is_empty()).then(|| base.to_string())
+        })
+        .unwrap_or_else(|| process.name.clone())
+}
+
+async fn publish_foreground_process(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    process: Option<crate::api::schema::ForegroundProcessInfo>,
+    last_published: &mut Option<Option<crate::api::schema::ForegroundProcessInfo>>,
+) {
+    if last_published.as_ref() == Some(&process) {
+        return;
+    }
+    *last_published = Some(process.clone());
+    if let Err(e) = state_events
+        .send(AppEvent::ForegroundProcessChanged { pane_id, process })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver ForegroundProcessChanged event"
+        );
     }
 }
 
@@ -830,6 +895,7 @@ fn spawn_basic_detection_task(
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
+        let mut last_foreground_process = None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -916,6 +982,13 @@ fn spawn_basic_detection_task(
                 let had_process_probe = has_process_probe;
                 has_process_probe = true;
                 let probe = probe_foreground_process(pid, foreground_pgid);
+                publish_foreground_process(
+                    &state_events,
+                    pane_id,
+                    probe.foreground_process,
+                    &mut last_foreground_process,
+                )
+                .await;
                 let process_group_id = probe.process_group_id;
                 let tracked_process_group_id =
                     process_group_for_change_tracking(foreground_pgid, process_group_id);
@@ -2783,6 +2856,7 @@ impl PaneRuntime {
                 let mut pending_idle = PendingIdleConfirmation::default();
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
+                let mut last_foreground_process = None;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2907,6 +2981,13 @@ impl PaneRuntime {
                         has_process_probe = true;
                         if pid > 0 {
                             let probe = probe_foreground_process(pid, foreground_pgid);
+                            publish_foreground_process(
+                                &state_events,
+                                pane_id,
+                                probe.foreground_process,
+                                &mut last_foreground_process,
+                            )
+                            .await;
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;
                             let tracked_process_group_id = process_group_for_change_tracking(
@@ -5563,6 +5644,142 @@ mod tests {
             argv: None,
             cmdline: None,
         }
+    }
+
+    #[test]
+    fn foreground_process_info_prefers_group_leader() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(100, "less"),
+                foreground_process(99, "git"),
+            ],
+        };
+        let info = foreground_process_info(&job, 42).unwrap();
+        assert_eq!(info.name, "git");
+        assert!(!info.is_shell);
+
+        let leaderless = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(100, "less"),
+                foreground_process(101, "cat"),
+            ],
+        };
+        assert_eq!(
+            foreground_process_info(&leaderless, 42).unwrap().name,
+            "less"
+        );
+
+        let empty = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: Vec::new(),
+        };
+        assert_eq!(foreground_process_info(&empty, 42), None);
+    }
+
+    #[test]
+    fn foreground_process_info_marks_pane_shell() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv0: Some("-zsh".into()),
+                argv: Some(vec!["-zsh".into()]),
+                ..foreground_process(42, "zsh")
+            }],
+        };
+        let info = foreground_process_info(&job, 42).unwrap();
+        assert_eq!(info.name, "zsh");
+        assert_eq!(info.argv, vec!["-zsh".to_string()]);
+        assert!(info.is_shell);
+    }
+
+    #[test]
+    fn foreground_process_name_normalizes_paths_and_login_dashes() {
+        let with = |argv0: Option<&str>, argv: Option<Vec<&str>>, name: &str| {
+            foreground_process_name(&crate::platform::ForegroundProcess {
+                argv0: argv0.map(str::to_string),
+                argv: argv.map(|argv| argv.into_iter().map(str::to_string).collect()),
+                ..foreground_process(7, name)
+            })
+        };
+        assert_eq!(with(Some("-zsh"), None, "zsh"), "zsh");
+        assert_eq!(with(Some("/usr/bin/htop"), None, "htop"), "htop");
+        assert_eq!(
+            with(None, Some(vec!["/usr/bin/htop", "-d", "5"]), "htop"),
+            "htop"
+        );
+        assert_eq!(with(None, Some(vec!["-bash"]), "bash"), "bash");
+        assert_eq!(with(None, None, "-fish"), "fish");
+        assert_eq!(with(Some(""), Some(vec![""]), "nvim"), "nvim");
+        assert_eq!(with(Some("-"), None, "nu"), "nu");
+    }
+
+    #[test]
+    fn foreground_process_info_caps_argv() {
+        let long_arg = format!("{}é", "a".repeat(FOREGROUND_PROCESS_MAX_ARG_BYTES - 1));
+        let mut argv = vec!["nvim".to_string(), long_arg];
+        argv.extend((0..30).map(|index| format!("file{index}")));
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv: Some(argv),
+                ..foreground_process(99, "nvim")
+            }],
+        };
+        let info = foreground_process_info(&job, 42).unwrap();
+        assert_eq!(info.argv.len(), FOREGROUND_PROCESS_MAX_ARGS);
+        assert_eq!(info.argv[0], "nvim");
+        // The two-byte 'é' straddles the limit, so it is dropped whole.
+        assert_eq!(
+            info.argv[1],
+            "a".repeat(FOREGROUND_PROCESS_MAX_ARG_BYTES - 1)
+        );
+        assert_eq!(info.argv[15], "file13");
+    }
+
+    #[test]
+    fn process_probe_carries_foreground_process_for_unidentified_jobs() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "htop")],
+        };
+        let result = probe_foreground_process_from_jobs(42, Some(99), None, || Some(job), |_| None);
+        assert_eq!(result.agent, None);
+        let info = result.foreground_process.unwrap();
+        assert_eq!(info.name, "htop");
+        assert!(!info.is_shell);
+
+        let missing = probe_foreground_process_from_jobs(42, None, None, || None, |_| None);
+        assert_eq!(missing.foreground_process, None);
+    }
+
+    #[tokio::test]
+    async fn foreground_process_publishes_only_changes() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let pane_id = PaneId::from_raw(1);
+        let htop = foreground_process_info(
+            &crate::platform::ForegroundJob {
+                process_group_id: 99,
+                processes: vec![foreground_process(99, "htop")],
+            },
+            42,
+        );
+        let mut last = None;
+        publish_foreground_process(&tx, pane_id, None, &mut last).await;
+        publish_foreground_process(&tx, pane_id, None, &mut last).await;
+        publish_foreground_process(&tx, pane_id, htop.clone(), &mut last).await;
+        publish_foreground_process(&tx, pane_id, htop.clone(), &mut last).await;
+        drop(tx);
+
+        let mut published = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let AppEvent::ForegroundProcessChanged { process, .. } = event else {
+                panic!("unexpected event");
+            };
+            published.push(process);
+        }
+        assert_eq!(published, vec![None, htop]);
     }
 
     #[test]

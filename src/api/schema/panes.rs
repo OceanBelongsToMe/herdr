@@ -457,6 +457,8 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_process: Option<ForegroundProcessInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -481,6 +483,17 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ForegroundProcessInfo {
+    /// Basename of the foreground job leader, without a login shell's leading `-`.
+    pub name: String,
+    /// Leading arguments, including argv[0], capped in count and per-argument length.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+    /// True when the foreground job is the pane's own shell, i.e. at a prompt.
+    pub is_shell: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -956,6 +956,101 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     cleanup_spawned_herdr(child, base);
 }
 
+#[test]
+fn pane_info_reports_foreground_process_and_shell_return() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child =
+        spawn_herdr_with_options(&config_home, &runtime_dir, &socket_path, None, "/bin/bash");
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"fp_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let foreground_process = |id: &str| {
+        let pane = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": id,
+                "method": "pane.get",
+                "params": { "pane_id": pane_id },
+            })
+            .to_string(),
+        );
+        pane["result"]["pane"]["foreground_process"].clone()
+    };
+    let wait_for_foreground = |id: &str, done: &dyn Fn(&serde_json::Value) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let process = foreground_process(id);
+            if done(&process) {
+                return process;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for foreground_process, last {process}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let shell = wait_for_foreground("fp_shell", &|process| process["is_shell"] == true);
+    assert_eq!(shell["name"], "bash");
+
+    let send_text = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_send",
+            "method": "pane.send_text",
+            "params": { "pane_id": pane_id, "text": "sleep 30" },
+        })
+        .to_string(),
+    );
+    assert_eq!(send_text["result"]["type"], "ok");
+    let send_enter = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_enter",
+            "method": "pane.send_keys",
+            "params": { "pane_id": pane_id, "keys": ["Enter"] },
+        })
+        .to_string(),
+    );
+    assert_eq!(send_enter["result"]["type"], "ok");
+
+    let sleep = wait_for_foreground("fp_sleep", &|process| process["name"] == "sleep");
+    assert_eq!(sleep["argv"], serde_json::json!(["sleep", "30"]));
+    assert_eq!(sleep["is_shell"], false);
+
+    let interrupt = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_interrupt",
+            "method": "pane.send_keys",
+            "params": { "pane_id": pane_id, "keys": ["ctrl+c"] },
+        })
+        .to_string(),
+    );
+    assert_eq!(interrupt["result"]["type"], "ok");
+
+    let returned = wait_for_foreground("fp_return", &|process| process["is_shell"] == true);
+    assert_eq!(returned["name"], "bash");
+
+    cleanup_spawned_herdr(child, base);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn new_terminal_cwd_follow_ignores_nonleader_group_member_cwd() {

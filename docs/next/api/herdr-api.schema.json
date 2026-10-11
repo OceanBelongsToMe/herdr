@@ -1430,6 +1430,30 @@
           ],
           "type": "string"
         },
+        "ForegroundProcessInfo": {
+          "properties": {
+            "argv": {
+              "description": "Leading arguments, including argv[0], capped in count and per-argument length.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "is_shell": {
+              "description": "True when the foreground job is the pane's own shell, i.e. at a prompt.",
+              "type": "boolean"
+            },
+            "name": {
+              "description": "Basename of the foreground job leader, without a login shell's leading `-`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "is_shell"
+          ],
+          "type": "object"
+        },
         "GeometryController": {
           "description": "The connection that sizes a tab, and the chrome it asked for.",
           "properties": {
@@ -1514,6 +1538,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "foreground_process": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/ForegroundProcessInfo"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "label": {
@@ -9020,6 +9054,30 @@
           ],
           "type": "string"
         },
+        "ForegroundProcessInfo": {
+          "properties": {
+            "argv": {
+              "description": "Leading arguments, including argv[0], capped in count and per-argument length.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "is_shell": {
+              "description": "True when the foreground job is the pane's own shell, i.e. at a prompt.",
+              "type": "boolean"
+            },
+            "name": {
+              "description": "Basename of the foreground job leader, without a login shell's leading `-`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "is_shell"
+          ],
+          "type": "object"
+        },
         "GeometryController": {
           "description": "The connection that sizes a tab, and the chrome it asked for.",
           "properties": {
@@ -9484,6 +9542,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "foreground_process": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ForegroundProcessInfo"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "label": {

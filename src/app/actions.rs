@@ -1622,6 +1622,8 @@ impl AppState {
                 }
                 Vec::new()
             }
+            // App::handle_internal_event intercepts this to emit pane.updated.
+            AppEvent::ForegroundProcessChanged { .. } => Vec::new(),
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,
