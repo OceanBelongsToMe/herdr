@@ -209,11 +209,13 @@ struct PendingAgentRelease {
     until: std::time::Instant,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Launch argv of herdr's interactive pane shell; None for requested commands.
+    pane_shell_argv: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -663,7 +665,7 @@ struct ProcessProbeResult {
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
     process_name: Option<String>,
-    foreground_process: Option<crate::api::schema::ForegroundProcessInfo>,
+    foreground_job: Option<crate::platform::ForegroundJob>,
 }
 
 fn agent_hint_for_foreground_job_members(
@@ -709,7 +711,7 @@ fn process_probe_result(
         foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
         process_name: Some(process_name),
-        foreground_process: foreground_process_info(job, pid),
+        foreground_job: Some(job.clone()),
     }
 }
 
@@ -771,7 +773,7 @@ fn probe_foreground_process_from_jobs(
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
             process_name: identified.map(|(_, process_name)| process_name),
-            foreground_process: foreground_process_info(job, pid),
+            foreground_job: foreground_job.clone(),
         };
     }
 
@@ -780,7 +782,7 @@ fn probe_foreground_process_from_jobs(
         foreground_is_pane_shell: false,
         agent: None,
         process_name: None,
-        foreground_process: None,
+        foreground_job: None,
     }
 }
 
@@ -790,22 +792,75 @@ const FOREGROUND_PROCESS_MAX_ARG_BYTES: usize = 256;
 fn foreground_process_info(
     job: &crate::platform::ForegroundJob,
     shell_pid: u32,
+    pane_shell_argv: Option<&[String]>,
 ) -> Option<crate::api::schema::ForegroundProcessInfo> {
     let process = job
         .processes
         .iter()
         .find(|process| process.pid == job.process_group_id)
         .or_else(|| job.processes.first())?;
+    let name = foreground_process_name(process);
+    let is_shell = process.pid == shell_pid
+        && is_known_shell_name(&name)
+        && process
+            .argv
+            .as_deref()
+            .is_some_and(|argv| pane_shell_argv == Some(argv) || shell_argv_has_no_operands(argv));
     let argv = process.argv.as_deref().unwrap_or_default();
     Some(crate::api::schema::ForegroundProcessInfo {
-        name: foreground_process_name(process),
+        name,
         argv: argv
             .iter()
             .take(FOREGROUND_PROCESS_MAX_ARGS)
             .map(|arg| arg[..arg.floor_char_boundary(FOREGROUND_PROCESS_MAX_ARG_BYTES)].to_string())
             .collect(),
-        is_shell: job.processes.iter().any(|process| process.pid == shell_pid),
+        is_shell,
     })
+}
+
+fn is_known_shell_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "zsh"
+            | "fish"
+            | "nu"
+            | "sh"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "mksh"
+            | "oksh"
+            | "loksh"
+            | "ksh93"
+            | "tcsh"
+            | "csh"
+            | "yash"
+            | "elvish"
+            | "xonsh"
+            | "pwsh"
+            | "powershell"
+    )
+}
+
+// A shell given a script or `-c` command is running it, not sitting at a prompt.
+fn shell_argv_has_no_operands(argv: &[String]) -> bool {
+    argv.iter().skip(1).all(|arg| arg.starts_with('-'))
+}
+
+// Windows only selects agents or the shell, so it has no general foreground job to report.
+fn published_foreground_process(
+    probe: &ProcessProbeResult,
+    shell_pid: u32,
+    pane_shell_argv: Option<&[String]>,
+) -> Option<crate::api::schema::ForegroundProcessInfo> {
+    if cfg!(windows) {
+        return None;
+    }
+    probe
+        .foreground_job
+        .as_ref()
+        .and_then(|job| foreground_process_info(job, shell_pid, pane_shell_argv))
 }
 
 // Linux reports no argv0 and truncates the process name, so argv[0] comes next.
@@ -859,6 +914,7 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 fn spawn_basic_detection_task(
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
+    pane_shell_argv: Option<Vec<String>>,
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
@@ -985,7 +1041,7 @@ fn spawn_basic_detection_task(
                 publish_foreground_process(
                     &state_events,
                     pane_id,
-                    probe.foreground_process,
+                    published_foreground_process(&probe, pid, pane_shell_argv.as_deref()),
                     &mut last_foreground_process,
                 )
                 .await;
@@ -1451,6 +1507,9 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    /// Launched as herdr's interactive pane shell; carried across handoff.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pane_shell_argv: Option<Vec<String>>,
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
@@ -2102,6 +2161,24 @@ fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<C
     pane_shell_command_builder_for_target(shell_config, ShellLaunchTarget::current())
 }
 
+// Mirrors portable-pty's exec: a default-program builder runs `$SHELL` with argv0 `-<basename>`.
+fn command_builder_exec_argv(cmd: &CommandBuilder) -> Option<Vec<String>> {
+    if cmd.is_default_prog() {
+        #[cfg(unix)]
+        {
+            let shell = cmd.get_shell();
+            let basename = shell.rsplit('/').next().unwrap_or(&shell);
+            return Some(vec![format!("-{basename}")]);
+        }
+        #[cfg(not(unix))]
+        return None;
+    }
+    cmd.get_argv()
+        .iter()
+        .map(|arg| arg.to_str().map(str::to_string))
+        .collect()
+}
+
 /// True when panes launch an interactive PowerShell directly on Windows.
 /// Gates the prompt-based cwd reporting pipeline and the agent-exit shell
 /// respawn recovery.
@@ -2258,6 +2335,7 @@ impl PaneRuntime {
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
             agent_state: None,
+            pane_shell_argv: self.pane_shell_argv.clone(),
         }
     }
 
@@ -2339,6 +2417,7 @@ impl PaneRuntime {
         cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
+        let pane_shell_argv = command_builder_exec_argv(&cmd);
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2355,6 +2434,7 @@ impl PaneRuntime {
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
                 windows_powershell_prompt_cwd_reporting,
+                pane_shell_argv,
             },
             AgentDetection::Enabled,
         )
@@ -2469,6 +2549,7 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
             agent_state: _,
+            pane_shell_argv,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -2606,6 +2687,7 @@ impl PaneRuntime {
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
+            pane_shell_argv.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
@@ -2634,6 +2716,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            pane_shell_argv,
             compression,
             detect_handle: Some(detect_handle),
         })
@@ -2829,6 +2912,7 @@ impl PaneRuntime {
             let detect_reset_notify = Arc::new(Notify::new());
             let detect_reset = detect_reset_notify.clone();
             let pending_release = Arc::new(Mutex::new(None));
+            let pane_shell_argv = initial_state.pane_shell_argv.clone();
             let pending_release_for_task = pending_release.clone();
 
             let handle = tokio::spawn(async move {
@@ -2984,7 +3068,11 @@ impl PaneRuntime {
                             publish_foreground_process(
                                 &state_events,
                                 pane_id,
-                                probe.foreground_process,
+                                published_foreground_process(
+                                    &probe,
+                                    pid,
+                                    pane_shell_argv.as_deref(),
+                                ),
                                 &mut last_foreground_process,
                             )
                             .await;
@@ -3256,6 +3344,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            pane_shell_argv: initial_state.pane_shell_argv,
             compression,
             detect_handle,
         })
@@ -4112,6 +4201,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                pane_shell_argv: None,
                 compression,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -5513,6 +5603,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            pane_shell_argv: None,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -5555,6 +5646,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            pane_shell_argv: None,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -5655,7 +5747,7 @@ mod tests {
                 foreground_process(99, "git"),
             ],
         };
-        let info = foreground_process_info(&job, 42).unwrap();
+        let info = foreground_process_info(&job, 42, None).unwrap();
         assert_eq!(info.name, "git");
         assert!(!info.is_shell);
 
@@ -5667,7 +5759,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            foreground_process_info(&leaderless, 42).unwrap().name,
+            foreground_process_info(&leaderless, 42, None).unwrap().name,
             "less"
         );
 
@@ -5675,11 +5767,21 @@ mod tests {
             process_group_id: 99,
             processes: Vec::new(),
         };
-        assert_eq!(foreground_process_info(&empty, 42), None);
+        assert_eq!(foreground_process_info(&empty, 42, None), None);
+    }
+
+    fn shell_pid_job(name: &str, argv: Option<&[&str]>) -> crate::platform::ForegroundJob {
+        crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv: argv.map(|argv| argv.iter().map(|arg| arg.to_string()).collect()),
+                ..foreground_process(42, name)
+            }],
+        }
     }
 
     #[test]
-    fn foreground_process_info_marks_pane_shell() {
+    fn foreground_process_info_marks_pane_shell_at_prompt() {
         let job = crate::platform::ForegroundJob {
             process_group_id: 42,
             processes: vec![crate::platform::ForegroundProcess {
@@ -5688,10 +5790,87 @@ mod tests {
                 ..foreground_process(42, "zsh")
             }],
         };
-        let info = foreground_process_info(&job, 42).unwrap();
+        let login_zsh = ["-zsh".to_string()];
+        let info = foreground_process_info(&job, 42, Some(&login_zsh)).unwrap();
         assert_eq!(info.name, "zsh");
         assert_eq!(info.argv, vec!["-zsh".to_string()]);
         assert!(info.is_shell);
+
+        let is_shell = |name: &str, argv: &[&str], launch: &[&str]| {
+            let launch: Vec<String> = launch.iter().map(|arg| arg.to_string()).collect();
+            foreground_process_info(&shell_pid_job(name, Some(argv)), 42, Some(&launch))
+                .unwrap()
+                .is_shell
+        };
+        // An unchanged launch argv stays at a prompt even with operand-style args.
+        let fish = ["fish", "--init-command", "x"];
+        assert!(is_shell("fish", &fish, &fish));
+        // After an `exec`, only an operand-free shell argv counts.
+        assert!(is_shell("zsh", &["zsh"], &["-bash"]));
+        assert!(!is_shell("bash", &["bash", "build.sh"], &["-bash"]));
+        assert!(!is_shell("fish", &["fish", "--init-command", "y"], &fish));
+    }
+
+    #[test]
+    fn command_builder_exec_argv_matches_portable_pty_exec() {
+        let mut cmd = CommandBuilder::new("fish");
+        cmd.args(["--init-command", "x"]);
+        assert_eq!(
+            command_builder_exec_argv(&cmd),
+            Some(vec!["fish".into(), "--init-command".into(), "x".into()])
+        );
+
+        #[cfg(unix)]
+        {
+            let mut login = CommandBuilder::new_default_prog();
+            login.env("SHELL", "/bin/sh");
+            assert_eq!(
+                command_builder_exec_argv(&login),
+                Some(vec!["-sh".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_process_info_rejects_non_shell_child_pid() {
+        let exec_htop = shell_pid_job("htop", Some(&["htop"]));
+        let info = foreground_process_info(&exec_htop, 42, Some(&["-bash".to_string()])).unwrap();
+        assert_eq!(info.name, "htop");
+        assert!(!info.is_shell);
+
+        let argv_htop = shell_pid_job("htop", Some(&["htop", "-d", "5"]));
+        let info = foreground_process_info(&argv_htop, 42, None).unwrap();
+        assert_eq!(info.name, "htop");
+        assert!(!info.is_shell);
+    }
+
+    #[test]
+    fn foreground_process_info_requires_shell_without_operands_for_commands() {
+        let is_shell = |name: &str, argv: Option<&[&str]>| {
+            foreground_process_info(&shell_pid_job(name, argv), 42, None)
+                .unwrap()
+                .is_shell
+        };
+        assert!(!is_shell("bash", Some(&["bash", "build.sh"])));
+        assert!(!is_shell("sh", Some(&["sh", "-c", "htop"])));
+        assert!(!is_shell("zsh", None));
+        assert!(is_shell("zsh", Some(&["zsh"])));
+        assert!(is_shell("zsh", Some(&["/bin/zsh", "-l"])));
+        assert!(is_shell("zsh", Some(&["-zsh"])));
+
+        // A shell the pane's shell started is a job, not the pane at a prompt.
+        let subshell = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv: Some(vec!["bash".into()]),
+                ..foreground_process(99, "bash")
+            }],
+        };
+        assert!(
+            !foreground_process_info(&subshell, 42, Some(&["bash".to_string()]))
+                .unwrap()
+                .is_shell
+        );
     }
 
     #[test]
@@ -5727,7 +5906,7 @@ mod tests {
                 ..foreground_process(99, "nvim")
             }],
         };
-        let info = foreground_process_info(&job, 42).unwrap();
+        let info = foreground_process_info(&job, 42, None).unwrap();
         assert_eq!(info.argv.len(), FOREGROUND_PROCESS_MAX_ARGS);
         assert_eq!(info.argv[0], "nvim");
         // The two-byte 'é' straddles the limit, so it is dropped whole.
@@ -5744,14 +5923,24 @@ mod tests {
             process_group_id: 99,
             processes: vec![foreground_process(99, "htop")],
         };
-        let result = probe_foreground_process_from_jobs(42, Some(99), None, || Some(job), |_| None);
+        let result =
+            probe_foreground_process_from_jobs(42, Some(99), None, || Some(job.clone()), |_| None);
         assert_eq!(result.agent, None);
-        let info = result.foreground_process.unwrap();
-        assert_eq!(info.name, "htop");
-        assert!(!info.is_shell);
+        assert_eq!(result.foreground_job.as_ref(), Some(&job));
+        let published = published_foreground_process(&result, 42, Some(&["-bash".to_string()]));
+        if cfg!(windows) {
+            assert_eq!(published, None);
+        } else {
+            let info = published.unwrap();
+            assert_eq!(info.name, "htop");
+            assert!(!info.is_shell);
+        }
 
         let missing = probe_foreground_process_from_jobs(42, None, None, || None, |_| None);
-        assert_eq!(missing.foreground_process, None);
+        assert_eq!(
+            published_foreground_process(&missing, 42, Some(&["-bash".to_string()])),
+            None
+        );
     }
 
     #[tokio::test]
@@ -5764,6 +5953,7 @@ mod tests {
                 processes: vec![foreground_process(99, "htop")],
             },
             42,
+            None,
         );
         let mut last = None;
         publish_foreground_process(&tx, pane_id, None, &mut last).await;

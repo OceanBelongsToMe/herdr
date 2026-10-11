@@ -1048,6 +1048,47 @@ fn pane_info_reports_foreground_process_and_shell_return() {
     let returned = wait_for_foreground("fp_return", &|process| process["is_shell"] == true);
     assert_eq!(returned["name"], "bash");
 
+    // A pane launched directly with a program owns the child pid but is not a shell.
+    let applied = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_argv_layout",
+            "method": "layout.apply",
+            "params": {
+                "workspace_id": created["result"]["workspace"]["workspace_id"],
+                "root": { "type": "pane", "command": ["sleep", "30"] },
+            },
+        })
+        .to_string(),
+    );
+    let argv_pane_id = applied["result"]["layout"]["focused_pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("layout.apply failed: {applied}"))
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let argv_process = loop {
+        let pane = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "fp_argv",
+                "method": "pane.get",
+                "params": { "pane_id": argv_pane_id },
+            })
+            .to_string(),
+        );
+        let process = pane["result"]["pane"]["foreground_process"].clone();
+        if process["name"] == "sleep" {
+            break process;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for argv pane foreground_process, last {process}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(argv_process["argv"], serde_json::json!(["sleep", "30"]));
+    assert_eq!(argv_process["is_shell"], false);
+
     cleanup_spawned_herdr(child, base);
 }
 

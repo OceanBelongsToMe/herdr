@@ -576,7 +576,7 @@ Herdr 存有原生会话引用时,`pane.get`、`pane.list`、`agent.get` 和 `ag
 
 当 Herdr 能解析当前控制窗格 PTY 的进程的 cwd 时,`pane.get`、`pane.list`、`agent.get` 和 `agent.list` 也暴露 `foreground_cwd`。已有的 `cwd` 字段仍然是用于标签、follow-cwd 行为和恢复会话状态的窗格/工作区 cwd。
 
-`PaneInfo` 还暴露可选的 `foreground_process` 对象,描述窗格前台的作业。`name` 是作业首进程的可执行文件名(去掉登录 shell 开头的 `-`),`argv` 最多包含开头的 16 个参数,每个最多 256 字节,`is_shell` 在窗格自己的 shell 位于前台(即处于提示符)时为 true。任一值变化时 Herdr 会发出 `pane.updated`。Herdr 尚未检查窗格前台作业时,该字段被省略。
+`PaneInfo` 还暴露可选的 `foreground_process` 对象,描述窗格前台的作业。`name` 是作业首进程的可执行文件名(去掉登录 shell 开头的 `-`),`argv` 最多包含开头的 16 个参数,每个最多 256 字节,`is_shell` 在作业首进程是窗格自己的 shell 进程且处于提示符时为 true,即 Herdr 为窗格启动且启动参数未变的交互式 shell,或不带脚本或 `-c` 操作数的 shell。作为窗格启动命令运行的程序,或 shell 通过 `exec` 替换成的程序,报告为 `false`。任一值变化时 Herdr 会发出 `pane.updated`。Herdr 尚未检查窗格前台作业时,该字段被省略;在 Windows 上 Herdr 无法确定一般的前台作业,因此该字段始终被省略。
 
 ```json
 {

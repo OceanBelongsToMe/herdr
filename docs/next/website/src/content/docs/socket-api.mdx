@@ -720,7 +720,7 @@ If no native session reference is stored, the field is omitted.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
-`PaneInfo` also exposes an optional `foreground_process` object for the job in the pane's foreground. `name` is the job leader's executable basename with a login shell's leading `-` removed, `argv` holds at most 16 leading arguments of at most 256 bytes each, and `is_shell` is true when the pane's own shell is in the foreground, i.e. at a prompt. Herdr emits `pane.updated` when any of these change. The field is omitted when Herdr has not inspected the pane's foreground job.
+`PaneInfo` also exposes an optional `foreground_process` object for the job in the pane's foreground. `name` is the job leader's executable basename with a login shell's leading `-` removed, `argv` holds at most 16 leading arguments of at most 256 bytes each, and `is_shell` is true when the job leader is the pane's own shell process sitting at a prompt: either the interactive shell Herdr started for the pane with its launch arguments unchanged, or a shell with no script or `-c` operand. A program the pane was launched with, or one the shell `exec`s into, reports `false`. Herdr emits `pane.updated` when any of these change. The field is omitted when Herdr has not inspected the pane's foreground job, and always on Windows, where Herdr cannot determine a general foreground job.
 
 ```json
 {
