@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -12,8 +13,10 @@ class ConventionalCommitHistoryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="herdr-commit-history-")
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
+        excludes = self.repo / ".test-global-excludes"
+        excludes.write_text("", encoding="utf-8")
         self.env = {**os.environ, "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "core.excludesfile", "GIT_CONFIG_VALUE_0": os.devnull}
+                    "GIT_CONFIG_KEY_0": "core.excludesfile", "GIT_CONFIG_VALUE_0": str(excludes)}
         self.git("init", "-q", "-b", "master")
         self.git("config", "user.name", "History Test")
         self.git("config", "user.email", "history@example.invalid")
@@ -26,8 +29,11 @@ class ConventionalCommitHistoryTests(unittest.TestCase):
         self.git("merge", "-q", "--no-ff", "foreign-fork", "-m", "feat: integrate external fork")
 
     def git(self, *args):
-        return subprocess.check_output(["git", *args], cwd=self.repo, env=self.env,
-                                       text=True, stderr=subprocess.STDOUT)
+        result = subprocess.run(["git", *args], cwd=self.repo, env=self.env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0,
+                         f"git {args!r}: {result.stdout}{result.stderr}")
+        return result.stdout
 
     def commit(self, filename, message):
         (self.repo / filename).write_text(message, encoding="utf-8")
@@ -36,7 +42,7 @@ class ConventionalCommitHistoryTests(unittest.TestCase):
 
     def validate(self):
         script = Path(conventional_commits.__file__).resolve()
-        return subprocess.run(["python3", str(script), "--range", f"{self.base}..HEAD"],
+        return subprocess.run([sys.executable, str(script), "--range", f"{self.base}..HEAD"],
                               cwd=self.repo, env=self.env, text=True, capture_output=True)
 
     def test_foreign_history_preserves_authors_subjects(self):
