@@ -6353,16 +6353,26 @@ mod tests {
                 let snapshot = source.raw_snapshot(0, 1 << 20, None, None).unwrap();
                 let restored = replay_test_snapshot(&source, b"stale screen");
                 let cursor = format!("\x1b[{};{}H", snapshot.cursor.y + 1, snapshot.cursor.x + 1);
-                let mut source = source.core.lock().unwrap();
-                let mut restored = restored.core.lock().unwrap();
-                restored.terminal.write(cursor.as_bytes());
+                restored
+                    .core
+                    .lock()
+                    .unwrap()
+                    .terminal
+                    .write(cursor.as_bytes());
                 // Reflow again after replay: inserting plain newlines fixes
-                // the immediate picture but loses soft-wrap state.
+                // the immediate picture but loses soft-wrap state. Use the
+                // pane entry point so Windows refreshes its tracked rows.
                 for cols in [80, 64, 96, 80] {
-                    source.terminal.resize(cols, 24, 0, 0).unwrap();
-                    restored.terminal.resize(cols, 24, 0, 0).unwrap();
+                    source.resize_exact(24, cols, 0, 0);
+                    restored.resize_exact(24, cols, 0, 0);
+                    let source = source.core.lock().unwrap();
+                    let restored = restored.core.lock().unwrap();
                     let rows = source.terminal.total_rows().unwrap();
-                    assert_eq!(restored.terminal.total_rows().unwrap(), rows);
+                    assert_eq!(
+                        restored.terminal.total_rows().unwrap(),
+                        rows,
+                        "history={history} cols={cols} input={prefix:?}"
+                    );
                     for y in 0..rows as u32 {
                         assert_eq!(
                             restored
