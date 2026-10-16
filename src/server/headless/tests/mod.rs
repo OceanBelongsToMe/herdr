@@ -5040,6 +5040,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                             },
                         ),
                     },
+                    control: None,
                     respond_to,
                     response_write_complete: None,
                 });

@@ -325,11 +325,13 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     let paused_read = test.app_request();
     assert_eq!(paused_read.request.id, "slow:sub:1:read");
     assert!(matches!(paused_read.request.method, Method::PaneRead(_)));
-    // Every batch must finish before the held app request can time out.
-    let batches = EventHub::MAX_EVENTS / 128 + 1;
+    // Scale batch size with retained history so overflowing the slow cursor does
+    // not add socket polling round trips to the held app request's deadline.
+    let batch_size = EventHub::MAX_EVENTS / 4;
+    let batches = EventHub::MAX_EVENTS / batch_size + 1;
     let deadline = Instant::now() + RESPONSE_TIMEOUT;
     for batch in 0..batches {
-        let indices = batch * 128..(batch + 1) * 128;
+        let indices = batch * batch_size..(batch + 1) * batch_size;
         for index in indices.clone() {
             test.hub.push(renamed_event(index));
         }
@@ -338,7 +340,7 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
 
     reply_to_probe(paused_read);
     slow.assert_history_lost("slow");
-    let next = batches * 128;
+    let next = batches * batch_size;
     test.hub.push(renamed_event(next));
     healthy.assert_renames(next..next + 1, Instant::now() + RESPONSE_TIMEOUT);
 
