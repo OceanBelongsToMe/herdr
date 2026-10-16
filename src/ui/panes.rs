@@ -310,6 +310,59 @@ fn stable_scrollbar_gutter(
     (inner_rect, scrollbar_rect)
 }
 
+/// Layout chrome a tab is laid out with.
+#[derive(Clone, Copy)]
+struct TabChromeSettings {
+    borders: crate::config::PaneBordersConfig,
+    gaps: bool,
+    outer_borders: bool,
+    scrollbars: bool,
+}
+
+/// True when a control connection owns this tab's geometry.
+pub(super) fn tab_geometry_is_control_owned(
+    app: &AppState,
+    ws_idx: usize,
+    tab: &crate::workspace::Tab,
+) -> bool {
+    !app.control_geometry_tabs.is_empty()
+        && app.workspaces.get(ws_idx).is_some_and(|workspace| {
+            app.control_geometry_tabs
+                .contains(&crate::workspace::public_tab_id_for_number(
+                    &workspace.id,
+                    tab.number,
+                ))
+        })
+}
+
+/// The server's chrome config, or none for a tab a control stream sizes
+/// chromeless (the client draws its own dividers and scrollbars).
+fn tab_chrome(app: &AppState, ws_idx: usize, tab: &crate::workspace::Tab) -> TabChromeSettings {
+    let chromeless = !app.control_chromeless_tabs.is_empty()
+        && app.workspaces.get(ws_idx).is_some_and(|workspace| {
+            app.control_chromeless_tabs
+                .contains(&crate::workspace::public_tab_id_for_number(
+                    &workspace.id,
+                    tab.number,
+                ))
+        });
+    if chromeless {
+        TabChromeSettings {
+            borders: crate::config::PaneBordersConfig::Off,
+            gaps: false,
+            outer_borders: false,
+            scrollbars: false,
+        }
+    } else {
+        TabChromeSettings {
+            borders: app.pane_borders,
+            gaps: app.pane_gaps,
+            outer_borders: app.pane_outer_borders,
+            scrollbars: app.pane_scrollbars,
+        }
+    }
+}
+
 /// Resize every visible runtime in a tab to the geometry it would receive if the tab were selected.
 pub(super) fn resize_tab_panes(
     app: &AppState,
@@ -320,20 +373,36 @@ pub(super) fn resize_tab_panes(
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
     let multi_pane = tab.layout.pane_count() > 1;
+    let chrome = tab_chrome(app, workspace_index, tab);
 
     if tab.zoomed {
         let focused_id = tab.layout.focused();
         if let Some((terminal_id, rt)) =
             runtime_for_tab_pane(app, terminal_runtimes, workspace_index, tab, focused_id)
         {
-            let pane_inner = pane_inner_rect(area, zoomed_pane_borders(app, multi_pane));
-            let inner_rect = terminal_inner_rect(rt, pane_inner, app.pane_scrollbars);
+            let borders = if chrome.borders.shows_borders(multi_pane) && chrome.outer_borders {
+                Borders::ALL
+            } else {
+                Borders::NONE
+            };
+            let pane_inner = pane_inner_rect(area, borders);
+            let inner_rect = terminal_inner_rect(rt, pane_inner, chrome.scrollbars);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
+                let size = app
+                    .control_pane_geometry
+                    .get(&focused_id)
+                    .copied()
+                    .unwrap_or(crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    });
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }
@@ -342,22 +411,30 @@ pub(super) fn resize_tab_panes(
 
     for info in apply_pane_chrome(
         tab.layout.panes(area),
-        app.pane_borders,
-        app.pane_gaps,
-        app.pane_outer_borders,
+        chrome.borders,
+        chrome.gaps,
+        chrome.outer_borders,
     ) {
         let pane_inner = pane_inner_rect(info.rect, info.borders);
 
         if let Some((terminal_id, rt)) =
             runtime_for_tab_pane(app, terminal_runtimes, workspace_index, tab, info.id)
         {
-            let inner_rect = terminal_inner_rect(rt, pane_inner, app.pane_scrollbars);
+            let inner_rect = terminal_inner_rect(rt, pane_inner, chrome.scrollbars);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
+                let size = app.control_pane_geometry.get(&info.id).copied().unwrap_or(
+                    crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    },
+                );
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }
@@ -383,26 +460,41 @@ pub(super) fn compute_pane_infos_for_tab(
     };
 
     let multi_pane = tab.layout.pane_count() > 1;
+    let chrome = tab_chrome(app, ws_idx, tab);
 
     if tab.zoomed {
         let focused_id = tab.layout.focused();
-        let borders = zoomed_pane_borders(app, multi_pane);
+        let borders = if chrome.borders.shows_borders(multi_pane) && chrome.outer_borders {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        };
         let pane_inner = pane_inner_rect(area, borders);
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
             (inner_rect, scrollbar_rect) =
-                stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
+                stable_scrollbar_gutter(rt, pane_inner, chrome.scrollbars);
             if resize_panes
                 && tab.terminal_id(focused_id).is_some_and(|terminal_id| {
                     !app.direct_attach_resize_locks.contains(terminal_id)
                 })
             {
+                let size = app
+                    .control_pane_geometry
+                    .get(&focused_id)
+                    .copied()
+                    .unwrap_or(crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    });
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }
@@ -418,9 +510,9 @@ pub(super) fn compute_pane_infos_for_tab(
 
     let mut pane_infos = apply_pane_chrome(
         tab.layout.panes(area),
-        app.pane_borders,
-        app.pane_gaps,
-        app.pane_outer_borders,
+        chrome.borders,
+        chrome.gaps,
+        chrome.outer_borders,
     );
 
     for info in &mut pane_infos {
@@ -430,17 +522,25 @@ pub(super) fn compute_pane_infos_for_tab(
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             (inner_rect, scrollbar_rect) =
-                stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
+                stable_scrollbar_gutter(rt, pane_inner, chrome.scrollbars);
             if resize_panes
                 && tab.terminal_id(info.id).is_some_and(|terminal_id| {
                     !app.direct_attach_resize_locks.contains(terminal_id)
                 })
             {
+                let size = app.control_pane_geometry.get(&info.id).copied().unwrap_or(
+                    crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    },
+                );
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }

@@ -12,6 +12,7 @@ pub mod response;
 pub mod server;
 pub mod session;
 pub mod tabs;
+pub mod terminal;
 pub mod workspaces;
 pub mod worktrees;
 
@@ -26,6 +27,7 @@ pub use response::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
+pub use terminal::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
@@ -145,6 +147,17 @@ operations::define_operations! {
     PluginPaneOpen(PluginPaneOpenParams) => "plugin.pane.open", true, false;
     PluginPaneFocus(PluginPaneFocusParams) => "plugin.pane.focus", true, false;
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
+    ControlOpen(ControlOpenParams) => "control.open", false, false;
+    ControlClose(EmptyParams) => "control.close", false, false;
+    TerminalAttach(TerminalAttachParams) => "terminal.attach", false, false;
+    TerminalDetach(TerminalAttachTarget) => "terminal.detach", false, false;
+    TerminalInput(TerminalInputParams) => "terminal.input", false, false;
+    TerminalSnapshot(TerminalAttachTarget) => "terminal.snapshot", false, false;
+    TerminalResize(TerminalResizeParams) => "terminal.resize", false, false;
+    TabSetGeometry(TabSetGeometryParams) => "tab.set_geometry", true, false;
+    TabSetPaneGeometry(TabSetPaneGeometryParams) => "tab.set_pane_geometry", true, false;
+    TabClaimGeometry(TabClaimGeometryParams) => "tab.claim_geometry", true, false;
+    ControlList(EmptyParams) => "control.list", false, false;
 }
 
 #[cfg(test)]

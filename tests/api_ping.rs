@@ -304,7 +304,18 @@ fn ping_over_socket_returns_version() {
     );
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
-    assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
+    // Preview and fork builds include their build identity in both surfaces.
+    let version_output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("--version")
+        .output()
+        .expect("read binary version");
+    assert!(version_output.status.success());
+    let version_output = String::from_utf8(version_output.stdout).expect("UTF-8 version");
+    let version = version_output
+        .trim()
+        .strip_prefix("herdr ")
+        .expect("version prefix");
+    assert_eq!(value["result"]["version"], version);
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], 22);
@@ -983,6 +994,142 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         split["result"]["pane"]["cwd"],
         foreground.display().to_string()
     );
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn pane_info_reports_foreground_process_and_shell_return() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child =
+        spawn_herdr_with_options(&config_home, &runtime_dir, &socket_path, None, "/bin/bash");
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"fp_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let foreground_process = |id: &str| {
+        let pane = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": id,
+                "method": "pane.get",
+                "params": { "pane_id": pane_id },
+            })
+            .to_string(),
+        );
+        pane["result"]["pane"]["foreground_process"].clone()
+    };
+    let wait_for_foreground = |id: &str, done: &dyn Fn(&serde_json::Value) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let process = foreground_process(id);
+            if done(&process) {
+                return process;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for foreground_process, last {process}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let shell = wait_for_foreground("fp_shell", &|process| process["is_shell"] == true);
+    assert_eq!(shell["name"], "bash");
+
+    let send_text = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_send",
+            "method": "pane.send_text",
+            "params": { "pane_id": pane_id, "text": "sleep 30" },
+        })
+        .to_string(),
+    );
+    assert_eq!(send_text["result"]["type"], "ok");
+    let send_enter = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_enter",
+            "method": "pane.send_keys",
+            "params": { "pane_id": pane_id, "keys": ["Enter"] },
+        })
+        .to_string(),
+    );
+    assert_eq!(send_enter["result"]["type"], "ok");
+
+    let sleep = wait_for_foreground("fp_sleep", &|process| process["name"] == "sleep");
+    assert_eq!(sleep["argv"], serde_json::json!(["sleep", "30"]));
+    assert_eq!(sleep["is_shell"], false);
+
+    let interrupt = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_interrupt",
+            "method": "pane.send_keys",
+            "params": { "pane_id": pane_id, "keys": ["ctrl+c"] },
+        })
+        .to_string(),
+    );
+    assert_eq!(interrupt["result"]["type"], "ok");
+
+    let returned = wait_for_foreground("fp_return", &|process| process["is_shell"] == true);
+    assert_eq!(returned["name"], "bash");
+
+    // A pane launched directly with a program owns the child pid but is not a shell.
+    let applied = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "fp_argv_layout",
+            "method": "layout.apply",
+            "params": {
+                "workspace_id": created["result"]["workspace"]["workspace_id"],
+                "root": { "type": "pane", "command": ["sleep", "30"] },
+            },
+        })
+        .to_string(),
+    );
+    let argv_pane_id = applied["result"]["layout"]["focused_pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("layout.apply failed: {applied}"))
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let argv_process = loop {
+        let pane = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "fp_argv",
+                "method": "pane.get",
+                "params": { "pane_id": argv_pane_id },
+            })
+            .to_string(),
+        );
+        let process = pane["result"]["pane"]["foreground_process"].clone();
+        if process["name"] == "sleep" {
+            break process;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for argv pane foreground_process, last {process}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(argv_process["argv"], serde_json::json!(["sleep", "30"]));
+    assert_eq!(argv_process["is_shell"], false);
 
     cleanup_spawned_herdr(child, base);
 }

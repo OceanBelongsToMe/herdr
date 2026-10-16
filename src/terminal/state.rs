@@ -140,6 +140,7 @@ pub struct TerminalState {
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
     pub terminal_title: Option<String>,
+    pub foreground_process: Option<crate::api::schema::ForegroundProcessInfo>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
@@ -180,6 +181,7 @@ impl TerminalState {
             reported_resume: None,
             reported_resume_revision: 0,
             terminal_title: None,
+            foreground_process: None,
             manual_label: None,
             agent_name: None,
             agent_name_owner: None,
@@ -283,6 +285,18 @@ impl TerminalState {
             raw_changed: true,
             stripped_changed,
         }
+    }
+
+    pub(crate) fn set_foreground_process(
+        &mut self,
+        process: Option<crate::api::schema::ForegroundProcessInfo>,
+    ) -> bool {
+        if self.foreground_process == process {
+            return false;
+        }
+        self.foreground_process = process;
+        self.revision = self.revision.wrapping_add(1);
+        true
     }
 
     pub fn with_launch_argv(mut self, argv: Vec<String>) -> Self {

@@ -1213,10 +1213,16 @@ pub const PageFormatter = struct {
                 break :cells_subset .{ subset, row_start_x };
             };
 
-            // If this row is blank, accumulate to avoid a bunch of extra
-            // work later. If it isn't blank, make sure we dump all our
-            // blanks.
-            if (!Cell.hasTextAny(cells_subset)) {
+            // Styled output must retain erased background fills and styled
+            // empty cells, just like the cell loop below. A row without text
+            // can still be visible; only plaintext can ignore its styling.
+            const has_content = if (comptime formatStyled(emit)) content: {
+                for (cells_subset) |cell| {
+                    if (!cell.isEmpty() or cell.hasStyling()) break :content true;
+                }
+                break :content false;
+            } else Cell.hasTextAny(cells_subset);
+            if (!has_content) {
                 blank_rows += 1;
                 continue;
             }
@@ -1302,6 +1308,9 @@ pub const PageFormatter = struct {
                 if (cp_map_empty) fast: {
                     if (comptime formatStyled(emit)) {
                         if (style_id == invalid_style_id) break :fast;
+                        // Pending untouched cells need the default style before
+                        // a run can resume the preceding styled text.
+                        if (blank_cells > 0 and style_id != 0) break :fast;
                     }
 
                     const consumed = try self.writeCellRun(
@@ -1361,6 +1370,15 @@ pub const PageFormatter = struct {
                 // This cell is not blank. If we have accumulated blank cells
                 // then we want to emit them now.
                 if (blank_cells > 0) {
+                    // Accumulated empty cells have the default style. Close
+                    // the preceding cell's style before writing the gap so
+                    // its background and attributes don't bleed into it.
+                    if (!style.default()) {
+                        try self.formatStyleClose(emit, writer);
+                        style = .{};
+                        style_id = 0;
+                    }
+
                     try writer.splatByteAll(' ', blank_cells);
 
                     if (self.point_map) |*map| try self.appendBlankPoints(
@@ -4105,6 +4123,87 @@ test "Page VT multi-line with styles" {
 
     // Verify point map matches output length
     try testing.expectEqual(output.len, point_map.items.len);
+}
+
+test "Page styles close before empty cell gaps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[48;5;12mBAR  \x1b[0m\x1b[1;10HRIGHT");
+
+    const page = t.screens.active.pages.pages.last.?.page();
+    const Case = struct { emit: Format, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .emit = .plain, .expected = "BAR      RIGHT" },
+        .{
+            .emit = .vt,
+            .expected = "\x1b[0m\x1b[48;5;12mBAR  \x1b[0m    RIGHT",
+        },
+        .{
+            .emit = .html,
+            .expected = "<div style=\"font-family: monospace; white-space: pre;\">" ++
+                "<div style=\"display: inline;background-color: var(--vt-palette-12);\">" ++
+                "BAR  </div>    RIGHT</div>",
+        },
+    };
+    for (cases) |case| {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: PageFormatter = .init(page, .{ .emit = case.emit });
+        var point_map: std.ArrayList(Coordinate) = .empty;
+        defer point_map.deinit(alloc);
+        formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+
+        try formatter.format(&builder.writer);
+        const output = builder.writer.buffered();
+        try testing.expectEqualStrings(case.expected, output);
+        try testing.expectEqual(output.len, point_map.items.len);
+    }
+}
+
+test "Page styles resume after empty cell gaps before same-style runs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[48;5;12mBAR  \x1b[0m\x1b[1;10H\x1b[48;5;12mRIGHT");
+
+    const page = t.screens.active.pages.pages.last.?.page();
+    const Case = struct { emit: Format, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .emit = .plain, .expected = "BAR      RIGHT" },
+        .{
+            .emit = .vt,
+            .expected = "\x1b[0m\x1b[48;5;12mBAR  \x1b[0m    \x1b[0m\x1b[48;5;12mRIGHT\x1b[0m",
+        },
+        .{
+            .emit = .html,
+            .expected = "<div style=\"font-family: monospace; white-space: pre;\">" ++
+                "<div style=\"display: inline;background-color: var(--vt-palette-12);\">" ++
+                "BAR  </div>    <div style=\"display: inline;background-color: var(--vt-palette-12);\">" ++
+                "RIGHT</div></div>",
+        },
+    };
+    for (cases) |case| {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: PageFormatter = .init(page, .{ .emit = case.emit });
+        var point_map: std.ArrayList(Coordinate) = .empty;
+        defer point_map.deinit(alloc);
+        formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+
+        try formatter.format(&builder.writer);
+        const output = builder.writer.buffered();
+        try testing.expectEqualStrings(case.expected, output);
+        try testing.expectEqual(output.len, point_map.items.len);
+    }
 }
 
 test "Page VT duplicate style not emitted twice" {
@@ -7026,5 +7125,83 @@ test "Page HTML hyperlink point map maps closing to previous cell" {
     const expected_coord = point_map.items[closing_idx - 1];
     for (closing_idx..closing_idx + "</a>".len) |i| {
         try testing.expectEqual(expected_coord, point_map.items[i]);
+    }
+}
+
+test "Page background-only rows retain styling" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Case = struct { sgr: []const u8, css: []const u8 };
+    const cases = [_]Case{
+        .{ .sgr = "\x1b[48;5;12m", .css = "var(--vt-palette-12)" },
+        .{ .sgr = "\x1b[48;2;17;34;51m", .css = "rgb(17, 34, 51)" },
+    };
+    for (cases) |case| {
+        var t = try Terminal.init(testing.io, alloc, .{ .cols = 6, .rows = 3 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(case.sgr);
+        s.nextSlice("\x1b[2J\x1b[0m");
+        const page = t.screens.active.pages.pages.last.?.page();
+
+        for ([_]Format{ .plain, .vt, .html }) |emit| {
+            var builder: std.Io.Writer.Allocating = .init(alloc);
+            defer builder.deinit();
+            var formatter: PageFormatter = .init(page, .{ .emit = emit });
+            var point_map: std.ArrayList(Coordinate) = .empty;
+            defer point_map.deinit(alloc);
+            formatter.point_map = .{ .alloc = alloc, .map = &point_map };
+            try formatter.format(&builder.writer);
+            const output = builder.writer.buffered();
+
+            var expected: std.Io.Writer.Allocating = .init(alloc);
+            defer expected.deinit();
+            if (emit == .html) try expected.writer.writeAll(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+            );
+            if (formatStyled(emit)) {
+                for (0..3) |y| {
+                    if (y > 0) try expected.writer.writeAll(if (emit == .vt) "\r\n" else "\n");
+                    switch (emit) {
+                        .vt => try expected.writer.print("\x1b[0m{s}      \x1b[0m", .{case.sgr}),
+                        .html => try expected.writer.print(
+                            "<div style=\"display: inline;background-color: {s};\">      </div>",
+                            .{case.css},
+                        ),
+                        .plain => unreachable,
+                    }
+                }
+            }
+            if (emit == .html) try expected.writer.writeAll("</div>");
+            try testing.expectEqualStrings(expected.writer.buffered(), output);
+            try testing.expectEqual(output.len, point_map.items.len);
+        }
+    }
+}
+
+test "Page background-only row respects selected columns" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 6, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[1;4H\x1b[48;5;12m\x1b[K\x1b[0m");
+    const page = t.screens.active.pages.pages.last.?.page();
+
+    for ([_]size.CellCountInt{ 0, 3 }) |start| {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        var formatter: PageFormatter = .init(page, .vt);
+        formatter.start_x = start;
+        formatter.end_x = start + 2;
+        formatter.start_y = 0;
+        formatter.end_y = 0;
+        try formatter.format(&builder.writer);
+        try testing.expectEqualStrings(
+            if (start == 0) "" else "\x1b[0m\x1b[48;5;12m   \x1b[0m",
+            builder.writer.buffered(),
+        );
     }
 }

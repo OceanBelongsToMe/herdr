@@ -185,6 +185,11 @@ pub enum AppEvent {
         pane_id: PaneId,
         cwd: std::path::PathBuf,
     },
+    /// Process probing observed a different foreground job in a pane.
+    ForegroundProcessChanged {
+        pane_id: PaneId,
+        process: Option<crate::api::schema::ForegroundProcessInfo>,
+    },
     /// Background git status refresh completed for workspaces.
     GitStatusRefreshed {
         results: Vec<WorkspaceGitStatus>,

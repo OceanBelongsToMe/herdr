@@ -257,6 +257,10 @@ impl TerminalRuntime {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
 
+    pub(crate) fn hold_content_write_lock(&self) -> crate::pane::ContentWriteHold<'_> {
+        self.0.hold_content_write_lock()
+    }
+
     #[cfg(unix)]
     pub fn nudge_child_redraw_after_handoff(&self) {
         self.0.nudge_child_redraw_after_handoff();
@@ -482,6 +486,43 @@ impl TerminalRuntime {
         self.0.validate_input_submission(bytes)
     }
 
+    pub(crate) fn raw_input_sink(&self) -> crate::pane::raw_stream::RawInputSink {
+        self.0.raw_input_sink()
+    }
+
+    pub(crate) fn attach_raw(
+        &self,
+        attach_id: String,
+        outbound: crate::api::control::ControlOutboundSender,
+        budget: std::sync::Arc<crate::pane::raw_stream::RawTapBudget>,
+        suppress_terminal_responses: bool,
+        protocol: u32,
+    ) {
+        self.0.attach_raw(
+            attach_id,
+            outbound,
+            budget,
+            suppress_terminal_responses,
+            protocol,
+        )
+    }
+
+    pub(crate) fn set_raw_query_authority(&self, attach_id: Option<&str>) {
+        self.0.set_raw_query_authority(attach_id)
+    }
+
+    pub(crate) fn snapshot_raw(&self, attach_id: &str, history_limit_bytes: usize) -> bool {
+        self.0.snapshot_raw(attach_id, history_limit_bytes)
+    }
+
+    pub(crate) fn detach_raw(
+        &self,
+        attach_id: &str,
+        reason: crate::api::schema::TerminalDetachReason,
+    ) -> bool {
+        self.0.detach_raw(attach_id, reason)
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -659,6 +700,14 @@ impl TerminalRuntime {
 
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
         self.0.test_process_pty_bytes(bytes);
+    }
+
+    pub(crate) fn raw_query_authority_for_test(&self) -> Option<String> {
+        self.0.raw_query_authority_for_test()
+    }
+
+    pub(crate) fn suppresses_terminal_responses_for_test(&self) -> bool {
+        self.0.suppresses_terminal_responses_for_test()
     }
 
     pub(crate) fn test_with_scrollback_bytes(

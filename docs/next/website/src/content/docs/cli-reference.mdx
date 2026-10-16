@@ -376,6 +376,7 @@ herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
 herdr terminal title set <title>
 herdr terminal title clear
+herdr [--session <name>] control
 ```
 
 Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ctrl+b`.
@@ -403,6 +404,13 @@ On Linux and macOS, an observer is disconnected if a socket write makes no progr
 for 30 seconds. A stalled stream can end without a final `terminal.closed` record;
 the pane and other clients keep running. Quiet panes do not trigger this timeout.
 `terminal title clear` hands the outer terminal window title back to `ui.window_title`.
+`control` opens a socket API control stream and bridges it to stdin and stdout
+as newline-delimited JSON. The first line printed is the `control.open`
+response with the server's boot id and capabilities; requests written to stdin
+get their responses, subscription events, and raw `terminal.*` records on
+stdout. It exists for clients on an SSH exec channel that render panes with
+their own terminal emulator; the socket API documentation covers the
+`terminal.attach` family. EOF on stdin closes the stream.
 
 ## Output waits
 
@@ -567,6 +575,8 @@ These meanings apply to reads. For `pane wait-output` only, both `recent` and `r
 | `HERDR_CONFIG_PATH` | Override the config file path. |
 | `HERDR_SESSION` | Select a named session for CLI commands. |
 | `HERDR_SOCKET_PATH` | Low-level socket path override. |
+| `HERDR_CONTROL_CLIENT` | `name/version` that `herdr control` declares on `control.open`. |
+| `HERDR_CONTROL_PROTOCOL` | Highest control stream protocol `herdr control` negotiates. Unset means protocol 1; set `2` to opt in. With neither variable set no client identity is sent at all. |
 | `HERDR_PROCESS_DETECTION` | Linux process detection strategy: `native` (default) or opt-in `child-groups`. |
 | `HERDR_ENV` | Set to `1` inside Herdr-managed pane processes. |
 | `HERDR_PANE_ID` | Public pane id for the running pane process. |

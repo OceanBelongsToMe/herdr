@@ -2124,9 +2124,19 @@ impl App {
         ws_idx: usize,
         tab_idx: usize,
     ) -> Option<PaneLayoutSnapshot> {
+        self.pane_layout_snapshot_in_area(ws_idx, tab_idx, self.state.view.terminal_area)
+    }
+
+    /// Layout of one tab laid out in `area`, for clients whose tab size is
+    /// not the shared view area.
+    pub(crate) fn pane_layout_snapshot_in_area(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        area: ratatui::layout::Rect,
+    ) -> Option<PaneLayoutSnapshot> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
-        let area = self.state.view.terminal_area;
         let focused_pane_id = self.public_pane_id(ws_idx, tab.layout.focused())?;
         let panes = crate::ui::apply_pane_chrome(
             tab.layout.panes(area),
@@ -2137,6 +2147,7 @@ impl App {
         .into_iter()
         .filter_map(|pane| {
             Some(PaneLayoutPane {
+                terminal_size: None,
                 pane_id: self.public_pane_id(ws_idx, pane.id)?,
                 focused: pane.is_focused,
                 rect: pane.rect.into(),
@@ -2163,21 +2174,77 @@ impl App {
             })
             .collect();
 
+        let tab_id = self.public_tab_id(ws_idx, tab_idx)?;
+        let geometry_controller = Some(
+            self.state
+                .control_tab_geometry_controllers
+                .get(&tab_id)
+                .cloned()
+                .unwrap_or_default(),
+        );
         Some(PaneLayoutSnapshot {
             workspace_id: self.public_workspace_id(ws_idx),
-            tab_id: self.public_tab_id(ws_idx, tab_idx)?,
+            tab_id,
             zoomed: tab.zoomed,
             area: area.into(),
             focused_pane_id,
             panes,
             splits,
+            geometry_controller,
         })
+    }
+
+    /// Announces a change of the connection that sizes a tab.
+    pub(crate) fn emit_tab_geometry_changed(
+        &mut self,
+        tab_id: String,
+        geometry_controller: crate::api::schema::GeometryController,
+        previous: Option<crate::api::schema::GeometryController>,
+    ) {
+        let Some((ws_idx, _)) = self.parse_tab_id(&tab_id) else {
+            return;
+        };
+        let workspace_id = self.public_workspace_id(ws_idx);
+        self.emit_event(EventEnvelope {
+            event: EventKind::TabGeometryChanged,
+            data: EventData::TabGeometryChanged {
+                tab_id,
+                workspace_id,
+                geometry_controller,
+                previous,
+            },
+        });
     }
 
     pub(crate) fn emit_layout_updated_event(&mut self, ws_idx: usize, tab_idx: usize) {
         if let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) {
             self.emit_layout_updated_snapshot(layout);
         }
+    }
+
+    /// Layout for a control stream: the split structure from `area`, with
+    /// each pane's rectangle replaced by the inner rectangle its terminal is
+    /// sized to (borders, gutters, and zoom already applied).
+    pub(crate) fn control_tab_layout_snapshot(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        area: ratatui::layout::Rect,
+        pane_infos: &[crate::layout::PaneInfo],
+    ) -> Option<PaneLayoutSnapshot> {
+        let mut layout = self.pane_layout_snapshot_in_area(ws_idx, tab_idx, area)?;
+        layout.panes = pane_infos
+            .iter()
+            .filter_map(|info| {
+                Some(PaneLayoutPane {
+                    terminal_size: None,
+                    pane_id: self.public_pane_id(ws_idx, info.id)?,
+                    focused: info.is_focused,
+                    rect: info.inner_rect.into(),
+                })
+            })
+            .collect();
+        Some(layout)
     }
 
     pub(super) fn emit_layout_updated_snapshot(&mut self, layout: PaneLayoutSnapshot) {

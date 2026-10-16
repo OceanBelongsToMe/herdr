@@ -224,6 +224,7 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 focused: true,
                 cwd: None,
                 foreground_cwd: None,
+                foreground_process: None,
                 restore_error: None,
                 label: None,
                 agent: Some("pi".into()),
@@ -295,7 +296,7 @@ fn assert_subscription_history_loss(agent_status: bool) {
     // Hold the setup probe after the server pins its subscription cursor.
     let probe = test.app_request();
     assert!(probe.request.id.ends_with(":probe"));
-    for index in 0..600 {
+    for index in 0..EventHub::MAX_EVENTS + 88 {
         test.hub.push(renamed_event(index));
     }
     reply_to_probe(probe);
@@ -324,9 +325,10 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     let paused_read = test.app_request();
     assert_eq!(paused_read.request.id, "slow:sub:1:read");
     assert!(matches!(paused_read.request.method, Method::PaneRead(_)));
-    // All five batches must finish before the held app request can time out.
+    // Every batch must finish before the held app request can time out.
+    let batches = EventHub::MAX_EVENTS / 128 + 1;
     let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    for batch in 0..5 {
+    for batch in 0..batches {
         let indices = batch * 128..(batch + 1) * 128;
         for index in indices.clone() {
             test.hub.push(renamed_event(index));
@@ -336,8 +338,9 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
 
     reply_to_probe(paused_read);
     slow.assert_history_lost("slow");
-    test.hub.push(renamed_event(640));
-    healthy.assert_renames(640..641, Instant::now() + RESPONSE_TIMEOUT);
+    let next = batches * 128;
+    test.hub.push(renamed_event(next));
+    healthy.assert_renames(next..next + 1, Instant::now() + RESPONSE_TIMEOUT);
 
     let mut ordinary = test.connect();
     ordinary.send(json!({"id": "ordinary", "method": "workspace.list", "params": {}}));

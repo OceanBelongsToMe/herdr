@@ -29,6 +29,9 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
+    /// Older servers omit this; their panes fall back to the shell argv check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_shell_argv: Option<Vec<String>>,
 }
 
 #[cfg(unix)]

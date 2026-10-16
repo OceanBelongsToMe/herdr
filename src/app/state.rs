@@ -791,6 +791,18 @@ pub struct AppState {
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
+    /// Public tab ids a control stream sizes without borders, gaps, or
+    /// scrollbar gutters: panes tile the tab area exactly.
+    pub control_chromeless_tabs: std::collections::HashSet<String>,
+    /// Public tab ids whose geometry a control connection owns. Layout
+    /// recomputes driven by herdr's own view leave their panes alone; only
+    /// `tab.set_geometry` (through the layout boundary) resizes them.
+    pub control_geometry_tabs: std::collections::HashSet<String>,
+    pub control_pane_geometry:
+        std::collections::HashMap<crate::layout::PaneId, crate::api::schema::PaneTerminalSize>,
+    /// Who sizes each public tab id, as reported in layout snapshots.
+    pub control_tab_geometry_controllers:
+        std::collections::HashMap<String, crate::api::schema::GeometryController>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
@@ -1037,6 +1049,10 @@ impl AppState {
         Self {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            control_chromeless_tabs: std::collections::HashSet::new(),
+            control_geometry_tabs: std::collections::HashSet::new(),
+            control_pane_geometry: std::collections::HashMap::new(),
+            control_tab_geometry_controllers: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),

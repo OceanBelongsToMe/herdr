@@ -43,7 +43,13 @@ use super::{
 const DEFAULT_DETECTION_ROWS: usize = 24;
 const KITTY_GRAPHICS_REDRAW_SETTLE: Duration = Duration::from_millis(20);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
+/// ANSI insert mode (IRM); bit 15 marks a mode as ANSI rather than DEC
+/// private in libghostty's packed mode id.
+const MODE_INSERT: u16 = 4 | 0x8000;
+const MODE_ORIGIN: u16 = 6;
+const MODE_AUTOWRAP: u16 = 7;
 const MODE_MOUSE_X10: u16 = 9;
+const MODE_LEFT_RIGHT_MARGIN: u16 = 69;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
 const MODE_MOUSE_BUTTON_MOTION: u16 = 1002;
 const MODE_MOUSE_ANY_MOTION: u16 = 1003;
@@ -251,6 +257,17 @@ impl PaneTerminal {
             .resize(rows, cols, cell_width_px, cell_height_px)
     }
 
+    pub fn resize_exact(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Vec<Bytes> {
+        self.ghostty
+            .resize_exact(rows, cols, cell_width_px, cell_height_px)
+    }
+
     pub fn scroll_up(&self, lines: usize) {
         self.ghostty.scroll_up(lines);
     }
@@ -273,6 +290,17 @@ impl PaneTerminal {
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
         self.ghostty.scroll_metrics()
+    }
+
+    pub(crate) fn raw_snapshot(
+        &self,
+        seq: u64,
+        history_limit_bytes: usize,
+        title: Option<String>,
+        cwd: Option<String>,
+    ) -> Option<crate::api::schema::TerminalSnapshot> {
+        self.ghostty
+            .raw_snapshot(seq, history_limit_bytes, title, cwd)
     }
 
     pub(crate) fn search_text_window(
@@ -1685,6 +1713,30 @@ impl GhosttyPaneTerminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Vec<Bytes> {
+        self.resize_with(rows, cols, cell_width_px, cell_height_px, true)
+    }
+
+    /// Resize with no model-only recovery: the screen becomes exactly what
+    /// libghostty's reflow produces, so a raw-tap client replaying the same
+    /// byte stream at the same size lands on the same grid.
+    pub fn resize_exact(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Vec<Bytes> {
+        self.resize_with(rows, cols, cell_width_px, cell_height_px, false)
+    }
+
+    fn resize_with(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        recover_bottom: bool,
+    ) -> Vec<Bytes> {
         if let Ok(mut core) = self.core.lock() {
             let synchronized_output_before = core
                 .terminal
@@ -1702,15 +1754,14 @@ impl GhosttyPaneTerminal {
                         .saturating_sub(scrollbar.offset + scrollbar.len)
                 })
                 .unwrap_or(0);
-            let bottom_before_resize = ghostty_detection_text(&mut core)
-                .map(|text| !text.trim().is_empty())
-                .unwrap_or(false);
             let resize_recovery_probe_lines = usize::from(rows)
                 .saturating_mul(8)
                 .max(DEFAULT_DETECTION_ROWS);
-            let replay_ansi = if core.terminal.active_screen().ok()
-                == Some(crate::ghostty::ActiveScreen::Primary)
-                && bottom_before_resize
+            let replay_ansi = if recover_bottom
+                && core.terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Primary)
+                && ghostty_detection_text(&mut core)
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
             {
                 ghostty_recent_ansi(&mut core, resize_recovery_probe_lines, true)
                     .ok()
@@ -1737,11 +1788,11 @@ impl GhosttyPaneTerminal {
             }
             let terminal_responses = self.drain_pending_pty_responses();
 
-            let bottom_is_blank = ghostty_detection_text(&mut core)
-                .map(|text| text.trim().is_empty())
-                .unwrap_or(false);
-            if bottom_is_blank {
-                if let Some(ansi) = replay_ansi.as_deref() {
+            if let Some(ansi) = replay_ansi.as_deref() {
+                let bottom_is_blank = ghostty_detection_text(&mut core)
+                    .map(|text| text.trim().is_empty())
+                    .unwrap_or(false);
+                if bottom_is_blank {
                     core.terminal.scroll_viewport_bottom();
                     core.terminal.write(ansi.as_bytes());
                 }
@@ -1753,7 +1804,7 @@ impl GhosttyPaneTerminal {
                 windows_recent_fallback::update(&mut core);
             }
             ghostty_set_scroll_offset_from_bottom(&mut core.terminal, offset_from_bottom);
-            if offset_from_bottom > 0 {
+            if recover_bottom && offset_from_bottom > 0 {
                 let mut remaining = offset_from_bottom.min(resize_recovery_probe_lines);
                 while remaining > 0
                     && ghostty_visible_text(&mut core)
@@ -1827,6 +1878,220 @@ impl GhosttyPaneTerminal {
                 .saturating_sub(scrollbar.offset + scrollbar.len),
             max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
             viewport_rows: scrollbar.len,
+        })
+    }
+
+    /// Capture the active screen, terminal modes, and cursor for a raw
+    /// control-stream attach. The caller holds the pane content lock so the
+    /// snapshot is ordered against PTY output.
+    pub(crate) fn raw_snapshot(
+        &self,
+        seq: u64,
+        history_limit_bytes: usize,
+        title: Option<String>,
+        cwd: Option<String>,
+    ) -> Option<crate::api::schema::TerminalSnapshot> {
+        use crate::api::schema::{
+            PaneScrollInfo, TerminalCursorInfo, TerminalScreenKind, TerminalSnapshot,
+            TerminalStateInfo,
+        };
+
+        let mut core = self.core.lock().ok()?;
+        let core = &mut *core;
+        let cols = core.terminal.cols().ok()?;
+        let rows = core.terminal.rows().ok()?;
+        let (active_screen, primary, alternate, truncated) =
+            match core.terminal.active_screen().ok()? {
+                crate::ghostty::ActiveScreen::Primary => {
+                    let text = raw_primary_ansi(&core.terminal).ok()?;
+                    let (text, truncated) = truncate_history_tail(text, history_limit_bytes);
+                    (TerminalScreenKind::Primary, Some(text), None, truncated)
+                }
+                crate::ghostty::ActiveScreen::Alternate => {
+                    let text = ghostty_recent_ansi(core, usize::MAX, false).ok()?;
+                    (TerminalScreenKind::Alternate, None, Some(text), false)
+                }
+            };
+
+        // The active cursor, not the viewport's: another client may have
+        // scrolled this pane back, which must not move the client's cursor.
+        // Style belongs to the active cursor even when scrolling hides it
+        // from the viewport; a viewport cursor query then returns no value.
+        core.render_state.update(&core.terminal).ok()?;
+        let shape = cursor_shape_from_render_state(&core.render_state, &core.decscusr_tracker);
+        let cursor = TerminalCursorState {
+            x: core.terminal.cursor_x().unwrap_or(0),
+            y: core.terminal.cursor_y().unwrap_or(0),
+            visible: core.terminal.cursor_visible().unwrap_or(true),
+            shape,
+        };
+        // A cursor-position command clears the pending wrap, so the client
+        // reprints the cell under the cursor to set it again.
+        let pending_wrap = core.terminal.cursor_pending_wrap().unwrap_or(false);
+        let pending_wrap_cell = pending_wrap
+            .then(|| pending_wrap_cell_ansi(&core.terminal, cursor.x, cursor.y))
+            .flatten();
+
+        let terminal = &core.terminal;
+        let mode = |mode: u16| terminal.mode_get(mode).unwrap_or(false);
+        let application_cursor = mode(crate::ghostty::MODE_APPLICATION_CURSOR_KEYS);
+        let bracketed_paste = mode(crate::ghostty::MODE_BRACKETED_PASTE);
+        let focus_reporting = mode(crate::ghostty::MODE_FOCUS_EVENT);
+        let sgr_pixel_mouse = mode(crate::ghostty::MODE_MOUSE_SGR_PIXELS);
+        let mouse_alternate_scroll = mode(crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL);
+        let synchronized_output = mode(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT);
+        let color_scheme_reporting = mode(crate::ghostty::MODE_COLOR_SCHEME_REPORT);
+        let mouse_reporting = terminal.mouse_tracking_enabled().unwrap_or(false);
+        let kitty_keyboard_flags = u16::from(terminal.kitty_keyboard_flags().unwrap_or(0));
+
+        // Modes are listed by hand so the alternate-screen switch and
+        // synchronized output stay out: the client composes the screen switch
+        // itself, and replaying `?2026h` would freeze its rendering until the
+        // app ends the batch. Scrolling regions, tab stops, charsets, and the
+        // keyboard protocols come from the formatter below.
+        let mut state_ansi = String::new();
+        let modes = [
+            (
+                crate::ghostty::MODE_APPLICATION_CURSOR_KEYS,
+                application_cursor,
+            ),
+            (5, mode(5)), // Reverse video.
+            (MODE_ORIGIN, mode(MODE_ORIGIN)),
+            (MODE_AUTOWRAP, mode(MODE_AUTOWRAP)),
+            (8, mode(8)),   // Autorepeat.
+            (12, mode(12)), // Cursor blinking.
+            (45, mode(45)), // Reverse wrap.
+            (66, mode(66)), // Application keypad.
+            (67, mode(67)), // Backspace sends BS rather than DEL.
+            // Ahead of the formatter's DECSLRM: margins are ignored while
+            // the mode is off.
+            (MODE_LEFT_RIGHT_MARGIN, mode(MODE_LEFT_RIGHT_MARGIN)),
+            (MODE_MOUSE_X10, mode(MODE_MOUSE_X10)),
+            (MODE_MOUSE_PRESS_RELEASE, mode(MODE_MOUSE_PRESS_RELEASE)),
+            (MODE_MOUSE_BUTTON_MOTION, mode(MODE_MOUSE_BUTTON_MOTION)),
+            (MODE_MOUSE_ANY_MOTION, mode(MODE_MOUSE_ANY_MOTION)),
+            (crate::ghostty::MODE_FOCUS_EVENT, focus_reporting),
+            (
+                crate::ghostty::MODE_MOUSE_UTF8,
+                mode(crate::ghostty::MODE_MOUSE_UTF8),
+            ),
+            (
+                crate::ghostty::MODE_MOUSE_SGR,
+                mode(crate::ghostty::MODE_MOUSE_SGR),
+            ),
+            (
+                crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL,
+                mouse_alternate_scroll,
+            ),
+            (1015, mode(1015)), // URXVT mouse encoding.
+            (crate::ghostty::MODE_MOUSE_SGR_PIXELS, sgr_pixel_mouse),
+            (1035, mode(1035)), // Num Lock overrides application keypad.
+            (1036, mode(1036)), // Alt escape prefix.
+            (1039, mode(1039)), // Alt sends escape.
+            (1045, mode(1045)), // Extended reverse wrap.
+            (crate::ghostty::MODE_BRACKETED_PASTE, bracketed_paste),
+            (
+                crate::ghostty::MODE_GRAPHEME_CLUSTER,
+                mode(crate::ghostty::MODE_GRAPHEME_CLUSTER),
+            ),
+            (
+                crate::ghostty::MODE_COLOR_SCHEME_REPORT,
+                color_scheme_reporting,
+            ),
+            (2048, mode(2048)), // In-band size reports.
+        ];
+        // Mouse tracking and encoding are mutually exclusive in the parser:
+        // disabling any one resets the effective mode, even if another mode
+        // bit remains set. Apply all disables before enabling the saved modes.
+        for enabled in [false, true] {
+            for (number, value) in modes {
+                if value == enabled {
+                    state_ansi.push_str(&format!(
+                        "\x1b[?{number}{}",
+                        if enabled { 'h' } else { 'l' }
+                    ));
+                }
+            }
+        }
+        // Keyboard lock, insert, local echo, and newline are ANSI modes.
+        for (number, enabled) in [
+            (2, mode(2 | 0x8000)),
+            (4, mode(MODE_INSERT)),
+            (12, mode(12 | 0x8000)),
+            (20, mode(20 | 0x8000)),
+        ] {
+            state_ansi.push_str(&format!("\x1b[{number}{}", if enabled { 'h' } else { 'l' }));
+        }
+        if let Ok(extra) = terminal.raw_attach_state_ansi() {
+            state_ansi.push_str(&extra);
+        }
+        // A re-snapshot can reuse a terminal with an old keyboard stack.
+        // Clear it before rebuilding, including when the saved state is off.
+        state_ansi.push_str("\x1b[<65535u\x1b[=0u\x1b[>4;0m");
+        // The tracker replays the pushed Kitty keyboard stack, not just the
+        // current flags, so a later pop lands on the same state client side.
+        if let Some(keyboard) = core.kitty_keyboard.replay_ansi() {
+            state_ansi.push_str(&keyboard);
+        }
+        state_ansi.push_str(if cursor.visible {
+            "\x1b[?25h"
+        } else {
+            "\x1b[?25l"
+        });
+        // Shape zero restores the client default instead of retaining an
+        // old application's shape. Reapply cursor blinking after that reset.
+        state_ansi.push_str(&format!("\x1b[{} q", cursor.shape));
+        if cursor.shape == 0 {
+            state_ansi.push_str(if mode(12) { "\x1b[?12h" } else { "\x1b[?12l" });
+        }
+        let pen_ansi = terminal.pen_ansi().unwrap_or_default();
+
+        let scroll = terminal.scrollbar().ok().map(|scrollbar| PaneScrollInfo {
+            offset_from_bottom: scrollbar
+                .total
+                .saturating_sub(scrollbar.offset + scrollbar.len)
+                as u64,
+            max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len) as u64,
+            viewport_rows: scrollbar.len as u64,
+        });
+
+        Some(TerminalSnapshot {
+            seq,
+            active_screen,
+            primary,
+            alternate,
+            state_ansi,
+            pen_ansi,
+            cursor: TerminalCursorInfo {
+                x: cursor.x,
+                y: cursor.y,
+                visible: cursor.visible,
+                shape: cursor.shape,
+                pending_wrap,
+                pending_wrap_cell,
+            },
+            state: TerminalStateInfo {
+                cols,
+                rows,
+                application_cursor,
+                bracketed_paste,
+                focus_reporting,
+                mouse_reporting,
+                sgr_pixel_mouse,
+                mouse_alternate_scroll,
+                synchronized_output,
+                color_scheme_reporting,
+                kitty_keyboard_flags,
+                modify_other_keys_level: if terminal.modify_other_keys_enabled().ok()? {
+                    2
+                } else {
+                    0
+                },
+                title,
+                cwd,
+                scroll,
+            },
+            truncated,
         })
     }
 
@@ -2225,6 +2490,17 @@ impl GhosttyPaneTerminal {
         self.recent_text_snapshot(lines).text
     }
 
+    /// Screen rows as libghostty holds them, for comparison against a bare
+    /// terminal fed the same bytes.
+    #[cfg(test)]
+    pub(crate) fn recent_text_raw(&self, lines: usize) -> String {
+        self.core
+            .lock()
+            .ok()
+            .map(|core| recent_text_for_test(&core.terminal, lines))
+            .unwrap_or_default()
+    }
+
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         self.core
             .lock()
@@ -2594,6 +2870,20 @@ fn cursor_state_from_render_state(
     })
 }
 
+fn cursor_shape_from_render_state(
+    render_state: &crate::ghostty::RenderState,
+    decscusr_tracker: &DecscusrTracker,
+) -> u8 {
+    if decscusr_tracker.cursor_shape_overridden() {
+        render_state
+            .cursor()
+            .map(|cursor| decscusr_cursor_shape(cursor.visual_style, cursor.blinking))
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 type VisibleHyperlinks = Vec<((u16, u16), String, String)>;
 
 fn ghostty_clear_render_dirty(render_state: &mut crate::ghostty::RenderState, area_height: u16) {
@@ -2955,6 +3245,154 @@ fn ghostty_recent_ansi(
     ghostty_recent_ansi_snapshot(core, lines, unwrap).map(|snapshot| snapshot.text)
 }
 
+#[cfg(test)]
+pub(super) fn truncate_history_tail_for_test(text: String, limit: usize) -> (String, bool) {
+    truncate_history_tail(text, limit)
+}
+
+/// The cell under a pending-wrap cursor as styled VT the client prints from
+/// that position. The cursor rests on a wide glyph's spacer tail, so the
+/// glyph is printed from one column left, with a cursor-left ahead of it.
+fn pending_wrap_cell_ansi(terminal: &crate::ghostty::Terminal, x: u16, y: u16) -> Option<String> {
+    let start = match terminal.cell_wide(x, y).ok()? {
+        crate::ghostty::CellWide::SpacerTail => x.checked_sub(1)?,
+        _ => x,
+    };
+    let cell = terminal.cell_ansi(start, x, y).ok()?;
+    if cell.is_empty() {
+        return None;
+    }
+    Some(if start < x {
+        format!("\x1b[D{cell}")
+    } else {
+        cell
+    })
+}
+
+/// Serialize through the last row the VT formatter actually emits, then
+/// include every blank row below it. The recent-text range also includes the
+/// cursor, but the formatter trims trailing blank rows even when the cursor is
+/// on one of them. Padding from that range loses rows and shifts the screen.
+/// This runs only on raw attach/re-snapshot, not on PTY output or rendering.
+fn raw_primary_ansi(terminal: &crate::ghostty::Terminal) -> Result<String, crate::ghostty::Error> {
+    let total_rows = terminal.total_rows()?;
+    let cols = terminal.cols()?;
+    for end in (0..total_rows).rev() {
+        let row = terminal.read_ansi_screen(
+            (0, end as u32),
+            (cols.saturating_sub(1), end as u32),
+            false,
+            true,
+        )?;
+        if row.is_empty() {
+            continue;
+        }
+        let mut text = raw_primary_content_ansi(terminal, cols, end as u32)?;
+        for _ in end + 1..total_rows {
+            text.push_str("\r\n");
+        }
+        return Ok(text);
+    }
+    Ok(String::new())
+}
+
+/// Unwrapped text alone cannot represent an erased wrap continuation:
+/// the formatter elides its incoming wrap, then emits just one CRLF for the
+/// empty row, collapsing two physical rows into one. Keep normal text runs
+/// unwrapped, but recreate blank rows and their wrap flags explicitly. This
+/// is snapshot-only work; ordinary PTY output remains a raw byte stream.
+fn raw_primary_content_ansi(
+    terminal: &crate::ghostty::Terminal,
+    cols: u16,
+    end: u32,
+) -> Result<String, crate::ghostty::Error> {
+    use crate::ghostty::CellWide;
+
+    let last_col = cols.saturating_sub(1);
+    let mut text = String::new();
+    let mut start = 0;
+    let mut y = 0;
+    while y < end {
+        if !terminal
+            .read_ansi_screen((0, y), (last_col, y), false, true)?
+            .is_empty()
+        {
+            y += 1;
+            continue;
+        }
+        if start < y {
+            text.push_str(&terminal.read_ansi_screen(
+                (0, start),
+                (last_col, y - 1),
+                false,
+                true,
+            )?);
+            if terminal.screen_row_wrap(y - 1)? {
+                let wide = terminal.screen_cell_wide(last_col, y - 1)?;
+                if wide == CellWide::SpacerHead {
+                    // Recreate the wide-character spacer at the previous
+                    // right edge. The temporary glyph is erased below.
+                    text.push_str(&format!("\x1b[{cols}G\x1b[0m\u{3000}"));
+                } else {
+                    let x = if wide == CellWide::SpacerTail {
+                        last_col.saturating_sub(1)
+                    } else {
+                        last_col
+                    };
+                    let cell =
+                        terminal.read_ansi_screen((x, y - 1), (last_col, y - 1), false, false)?;
+                    text.push_str(&format!("\x1b[{}G\x1b[0m", x + 1));
+                    text.push_str(if cell.is_empty() { " " } else { &cell });
+                    // CUP/CHA clear pending-wrap; repaint the final cell and
+                    // print one temporary cell to actually enter the blank row.
+                    text.push_str("\x1b[0m ");
+                }
+            } else {
+                text.push_str("\r\n");
+            }
+        }
+        text.push_str("\x1b[0m");
+        while y < end
+            && terminal
+                .read_ansi_screen((0, y), (last_col, y), false, true)?
+                .is_empty()
+        {
+            text.push_str("\x1b[2K\r");
+            if terminal.screen_row_wrap(y)? {
+                // EL2 preserves wrap flags. Establish the outgoing wrap,
+                // then erase the temporary last-column space before this
+                // row can scroll into history. This also preserves reflow.
+                text.push_str(&format!("\x1b[{cols}G  \x1b[A\x1b[2K\x1b[B\r"));
+            } else {
+                text.push_str("\r\n");
+            }
+            y += 1;
+        }
+        start = y;
+    }
+    text.push_str(&terminal.read_ansi_screen((0, start), (last_col, end), false, true)?);
+    Ok(text)
+}
+
+/// Keep at most `limit` trailing bytes of history, cut on a line boundary
+/// so the first kept line starts clean. Returns whether anything was cut.
+fn truncate_history_tail(text: String, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text, false);
+    }
+    // Move onto a char boundary before slicing; the limit may land inside a
+    // multibyte character.
+    let mut start = text.len() - limit;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = text[start..]
+        .find('\n')
+        .map(|offset| start + offset + 1)
+        .unwrap_or(start);
+    (text[cut..].to_string(), true)
+}
+
 fn ghostty_recent_ansi_snapshot(
     core: &mut GhosttyPaneCore,
     lines: usize,
@@ -2989,6 +3427,11 @@ fn finish_recent_snapshot(
             .total_rows()
             .is_ok_and(|total_rows| total_rows > lines),
     }
+}
+
+#[cfg(test)]
+pub(super) fn recent_text_for_test(terminal: &crate::ghostty::Terminal, lines: usize) -> String {
+    ghostty_recent_text_for_terminal(terminal, lines).unwrap_or_default()
 }
 
 fn ghostty_recent_text_for_terminal(
@@ -5398,6 +5841,847 @@ mod tests {
             restored.keyboard_protocol(),
             Some(crate::input::KeyboardProtocol::Kitty { flags: 1 })
         );
+    }
+
+    /// A raw attach snapshot replays the pushed Kitty keyboard stack and the
+    /// scrolling region without any screen content in `state_ansi`.
+    #[test]
+    fn raw_snapshot_state_replays_keyboard_stack_without_content() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"SECRET-CONTENT\x1b[>1u\x1b[>5u\x1b[3;10r\x1b[4h\x1b[?69h\x1b[5;60s",
+            &tx,
+        );
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(
+            !snapshot.state_ansi.contains("SECRET"),
+            "state: {:?}",
+            snapshot.state_ansi
+        );
+        // Insert mode and the margin mode come back, the mode ahead of the
+        // DECSLRM it gates.
+        assert!(
+            snapshot.state_ansi.contains("\x1b[4h"),
+            "state: {:?}",
+            snapshot.state_ansi
+        );
+        let lrmm = snapshot
+            .state_ansi
+            .find("\x1b[?69h")
+            .expect("mode 69 restored");
+        let slrm = snapshot
+            .state_ansi
+            .find("\x1b[5;60s")
+            .expect("DECSLRM restored");
+        assert!(lrmm < slrm, "state: {:?}", snapshot.state_ansi);
+        assert!(snapshot.state_ansi.contains("\x1b[>1u\x1b[>5u"));
+        assert!(snapshot.state_ansi.contains("\x1b[3;10r"));
+        // Cursor sits after the text; the scrolling region moved it home.
+        assert_eq!((snapshot.cursor.x, snapshot.cursor.y), (0, 0));
+        assert!(snapshot
+            .primary
+            .as_deref()
+            .is_some_and(|primary| primary.contains("SECRET-CONTENT")));
+
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        restored.process_pty_bytes(pane_id, 0, snapshot.state_ansi.as_bytes(), &restored_tx);
+        restored.process_pty_bytes(pane_id, 0, b"\x1b[<u", &restored_tx);
+        assert_eq!(
+            restored.keyboard_protocol(),
+            Some(crate::input::KeyboardProtocol::Kitty { flags: 1 })
+        );
+    }
+
+    fn snapshot_test_pane(bytes: &[u8]) -> GhosttyPaneTerminal {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, bytes, &tx);
+        pane
+    }
+
+    fn replay_test_snapshot(pane: &GhosttyPaneTerminal, stale: &[u8]) -> GhosttyPaneTerminal {
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let restored = snapshot_test_pane(stale);
+        let mut core = restored.core.lock().unwrap();
+        // The same screen/mode normalization used by the raw control client.
+        core.terminal.write(b"\x1b[?1049l\x1b[0m\x1b[r\x1b[?69l\x1b[?6l\x1b[?7h\x1b[4l\x1b(B\x0f\x1b[3J\x1b[2J\x1b[H");
+        if let Some(primary) = &snapshot.primary {
+            core.terminal.write(primary.as_bytes());
+        }
+        if let Some(alternate) = &snapshot.alternate {
+            core.terminal.write(b"\x1b[?1049h\x1b[2J\x1b[H");
+            core.terminal.write(alternate.as_bytes());
+        }
+        core.terminal.write(snapshot.state_ansi.as_bytes());
+        drop(core);
+        restored
+    }
+
+    #[test]
+    fn raw_snapshot_replays_mouse_protocols() {
+        use crate::ghostty::{ffi, MouseEncoder, MouseEvent};
+
+        fn reports(pane: &GhosttyPaneTerminal) -> Vec<Vec<u8>> {
+            let core = pane.core.lock().unwrap();
+            let mut encoder = MouseEncoder::new().unwrap();
+            encoder.set_from_terminal(&core.terminal);
+            encoder.set_size(640, 192, 8, 8);
+            let mut event = MouseEvent::new().unwrap();
+            event.set_position(20.0, 30.0);
+            let mut result = Vec::new();
+            for (action, button) in [
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS, true),
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_RELEASE, true),
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_MOTION, true),
+                (ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_MOTION, false),
+            ] {
+                event.set_action(action);
+                if button {
+                    event.set_button(ffi::GhosttyMouseButton_GHOSTTY_MOUSE_BUTTON_LEFT);
+                } else {
+                    event.clear_button();
+                }
+                result.push(encoder.encode(&event).unwrap());
+            }
+            result
+        }
+
+        for alternate in [false, true] {
+            for tracking in [0, 9, 1000, 1002, 1003] {
+                for encoding in [0, 1005, 1006, 1015, 1016] {
+                    let mut setup = String::from(if alternate { "\x1b[?1049h" } else { "" });
+                    for mode in [tracking, encoding] {
+                        if mode != 0 {
+                            setup.push_str(&format!("\x1b[?{mode}h"));
+                        }
+                    }
+                    let pane = snapshot_test_pane(setup.as_bytes());
+                    let expected = reports(&pane);
+                    assert_eq!(!expected[0].is_empty(), tracking != 0);
+                    for stale in ["", "\x1b[?1003h\x1b[?1016h"] {
+                        let restored = replay_test_snapshot(&pane, stale.as_bytes());
+                        // Mode bits alone miss disabled encoder state. Check
+                        // actual press, release, drag, and motion bytes.
+                        assert_eq!(
+                            reports(&restored), expected,
+                            "alternate={alternate} tracking={tracking} encoding={encoding} stale={stale:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_replays_input_and_display_modes() {
+        for mode in [
+            1,
+            5,
+            8,
+            12,
+            25,
+            45,
+            66,
+            67,
+            1004,
+            1007,
+            1035,
+            1036,
+            1039,
+            1045,
+            2004,
+            2027,
+            2031,
+            2048,
+            2 | 0x8000,
+            4 | 0x8000,
+            12 | 0x8000,
+            20 | 0x8000,
+        ] {
+            let number = mode & 0x7fff;
+            let prefix = if mode & 0x8000 == 0 { "?" } else { "" };
+            for enabled in [false, true] {
+                let setup = format!("\x1b[{prefix}{number}{}", if enabled { 'h' } else { 'l' });
+                let stale = format!("\x1b[{prefix}{number}{}", if enabled { 'l' } else { 'h' });
+                let pane = snapshot_test_pane(setup.as_bytes());
+                let restored = replay_test_snapshot(&pane, stale.as_bytes());
+                assert_eq!(
+                    restored
+                        .core
+                        .lock()
+                        .unwrap()
+                        .terminal
+                        .mode_get(mode)
+                        .unwrap(),
+                    enabled,
+                    "mode={number} prefix={prefix} enabled={enabled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_state_omits_content_before_restoring_tabstops() {
+        for content in ["X", "H", "3", "漢"] {
+            let setup = format!("{content}\x1b[3g\x1b[1;3H\x1bH\x1b[1;17H\x1bH\x1b[4;7H");
+            let pane = snapshot_test_pane(setup.as_bytes());
+            let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+            let mut target = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+            target.write(b"sentinel");
+            target.write(snapshot.state_ansi.as_bytes());
+            assert_eq!(
+                target.read_text_screen((0, 0), (7, 0), false).unwrap(),
+                "sentinel"
+            );
+            target.write(b"\x1b[H\t");
+            assert_eq!(target.cursor_x().unwrap(), 2);
+            target.write(b"\t");
+            assert_eq!(target.cursor_x().unwrap(), 16);
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_replays_tabstops_with_origin_and_margins() {
+        let pane = snapshot_test_pane(
+            b"\x1b[3g\x1b[1;3H\x1bH\x1b[1;17H\x1bH\x1b[?69h\x1b[5;60s\x1b[3;10r\x1b[?6h",
+        );
+        let restored = replay_test_snapshot(&pane, b"");
+        for terminal in [&pane, &restored] {
+            let mut core = terminal.core.lock().unwrap();
+            core.terminal.write(b"\x1b[?6l\x1b[?69l\x1b[H\t");
+            assert_eq!(core.terminal.cursor_x().unwrap(), 2);
+            core.terminal.write(b"\t");
+            assert_eq!(core.terminal.cursor_x().unwrap(), 16);
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_reports_effective_modify_other_keys_mode() {
+        for (setup, expected) in [
+            (b"\x1b[>4;2m".as_slice(), 2),
+            (b"\x1b[>4;2m\x1b[>4;1m".as_slice(), 0),
+            (b"\x1b[>4;2m\x1b[>4;0m".as_slice(), 0),
+        ] {
+            let pane = snapshot_test_pane(setup);
+            let snapshot = pane.raw_snapshot(1, usize::MAX, None, None).unwrap();
+            assert_eq!(snapshot.state.modify_other_keys_level, expected);
+            let restored = replay_test_snapshot(&pane, b"");
+            assert_eq!(restored.modify_other_keys_level(), expected);
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_clears_stale_keyboard_and_pen_state() {
+        let pane = snapshot_test_pane(b"");
+        let restored = replay_test_snapshot(
+            &pane,
+            b"\x1b[>1u\x1b[>5u\x1b[>4;2m\x1b[1\"q\x1b]8;;https://example.test/stale\x1b\\\x1b)0",
+        );
+        let mut core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 0);
+        assert!(!core.terminal.modify_other_keys_enabled().unwrap());
+        assert_eq!(
+            core.terminal.pen_ansi().unwrap(),
+            pane.core.lock().unwrap().terminal.pen_ansi().unwrap()
+        );
+        core.terminal.write(b"\x1b[H\x0eq");
+        assert_eq!(
+            core.terminal.screen_cell(0, 0).unwrap().1,
+            vec![u32::from('q')]
+        );
+    }
+
+    #[test]
+    fn raw_snapshot_replays_keypad_backspace_and_newline_behavior() {
+        use crate::ghostty::{ffi, KeyEncoder, KeyEvent};
+
+        for enabled in [false, true] {
+            let setup = if enabled {
+                b"\x1b[?66h\x1b[?67h\x1b[?1035l\x1b[20h".as_slice()
+            } else {
+                b"\x1b[?66l\x1b[?67l\x1b[?1035h\x1b[20l".as_slice()
+            };
+            let pane = snapshot_test_pane(setup);
+            let restored = replay_test_snapshot(&pane, b"");
+            for terminal in [&pane, &restored] {
+                let mut core = terminal.core.lock().unwrap();
+                let mut encoder = KeyEncoder::new().unwrap();
+                encoder.set_from_terminal(&core.terminal);
+                let mut event = KeyEvent::new().unwrap();
+                event.set_action(ffi::GhosttyKeyAction_GHOSTTY_KEY_ACTION_PRESS);
+                event.set_key(ffi::GhosttyKey_GHOSTTY_KEY_BACKSPACE);
+                assert_eq!(
+                    encoder.encode(&event).unwrap(),
+                    if enabled { b"\x08" } else { b"\x7f" }
+                );
+                event.set_key(ffi::GhosttyKey_GHOSTTY_KEY_NUMPAD_1);
+                event.set_utf8("1");
+                assert_eq!(
+                    encoder.encode(&event).unwrap(),
+                    if enabled {
+                        b"\x1bOq".as_slice()
+                    } else {
+                        b"1".as_slice()
+                    }
+                );
+                core.terminal.write(b"\x1b[2;8H\n");
+                assert_eq!(
+                    core.terminal.cursor_x().unwrap(),
+                    if enabled { 0 } else { 7 }
+                );
+                assert_eq!(core.terminal.cursor_y().unwrap(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_repeated_replay_preserves_keyboard_stack() {
+        let pane = snapshot_test_pane(b"\x1b[>1u\x1b[>5u\x1b[>4;1m");
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let restored = replay_test_snapshot(&pane, snapshot.state_ansi.as_bytes());
+        let mut core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 5);
+        core.terminal.write(b"\x1b[<u");
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 1);
+        core.terminal.write(b"\x1b[<u");
+        assert_eq!(core.terminal.kitty_keyboard_flags().unwrap(), 0);
+    }
+
+    #[test]
+    fn raw_snapshot_replays_active_hyperlink_protection_and_charset() {
+        let pane = snapshot_test_pane(
+            b"\x1b[1\"q\x1b]8;;https://example.test/current\x1b\\\x1b)0\x0e\x1b[31m",
+        );
+        let restored = replay_test_snapshot(&pane, b"");
+        let expected_pen = pane.core.lock().unwrap().terminal.pen_ansi().unwrap();
+        let mut core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.pen_ansi().unwrap(), expected_pen);
+        core.terminal.write(b"\x1b[Hq");
+        assert_eq!(
+            core.terminal.screen_cell(0, 0).unwrap().1,
+            vec![u32::from('─')]
+        );
+        assert_eq!(
+            core.terminal
+                .viewport_hyperlink_uri(0, 0)
+                .unwrap()
+                .as_deref(),
+            Some("https://example.test/current")
+        );
+    }
+
+    #[test]
+    fn raw_snapshot_replays_cursor_shape_even_when_scrolled_back() {
+        fn appearance(pane: &GhosttyPaneTerminal) -> (crate::ghostty::CursorVisualStyle, bool) {
+            let core = pane.core.lock().unwrap();
+            let mut render = crate::ghostty::RenderState::new().unwrap();
+            render.update(&core.terminal).unwrap();
+            let cursor = render.cursor().unwrap();
+            (cursor.visual_style, cursor.blinking)
+        }
+        for shape in 0..=6 {
+            for scrolled in [false, true] {
+                let setup = format!("{}\x1b[{shape} q", "history\r\n".repeat(40));
+                let pane = snapshot_test_pane(setup.as_bytes());
+                if scrolled {
+                    pane.scroll_up(10);
+                }
+                let restored = replay_test_snapshot(&pane, b"\x1b[6 q");
+                assert_eq!(
+                    appearance(&restored),
+                    appearance(&pane),
+                    "shape={shape} scrolled={scrolled}"
+                );
+            }
+        }
+    }
+
+    /// The pen survives an attach: text typed after the snapshot keeps the
+    /// attributes the app had set, and the cursor is the active one even
+    /// when this pane is scrolled back.
+    #[test]
+    fn raw_snapshot_state_carries_the_pen_and_active_cursor() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 4, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let mut lines = Vec::new();
+        for n in 0..12 {
+            lines.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        lines.extend_from_slice(b"A\x1b[31m\x1b[?25l");
+        pane.process_pty_bytes(pane_id, 0, &lines, &tx);
+        pane.scroll_up(5);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(
+            snapshot.state_ansi.contains("\x1b[31m")
+                || snapshot.state_ansi.contains("\x1b[38;5;1m"),
+            "state: {:?}",
+            snapshot.state_ansi
+        );
+        assert_eq!(snapshot.cursor.x, 1);
+        assert_eq!(snapshot.cursor.y, 3);
+        assert!(!snapshot.cursor.visible);
+        assert!(!snapshot.cursor.pending_wrap);
+        assert!(snapshot.cursor.pending_wrap_cell.is_none());
+        assert!(
+            snapshot.pen_ansi.contains("\x1b[31m") || snapshot.pen_ansi.contains("\x1b[38;5;1m"),
+            "pen: {:?}",
+            snapshot.pen_ansi
+        );
+        assert!(!snapshot.pen_ansi.contains("line"));
+    }
+
+    /// Output that stops on the last column leaves the terminal about to
+    /// wrap. The client's cursor-position command clears that, so the
+    /// snapshot hands it the cell to reprint; the cursor stays put and the
+    /// next printable lands on the following row.
+    #[test]
+    fn raw_snapshot_carries_the_pending_wrap_cell() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"abcdefghi\x1b[32mJ", &tx);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(snapshot.cursor.pending_wrap);
+        assert_eq!((snapshot.cursor.x, snapshot.cursor.y), (9, 0));
+        let cell = snapshot.cursor.pending_wrap_cell.clone().unwrap();
+        assert!(
+            cell.ends_with('J') || cell.contains("J\x1b["),
+            "cell: {cell:?}"
+        );
+
+        // Replay the way a client does: home, print the cell, then continue.
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = Vec::new();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(b"\x1b[1;10H\x1b[0m");
+        replay.extend_from_slice(cell.as_bytes());
+        replay.extend_from_slice(b"\x1b[0m");
+        replay.extend_from_slice(snapshot.pen_ansi.as_bytes());
+        replay.extend_from_slice(b"K");
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.cursor_y().unwrap(), 1);
+        assert_eq!(core.terminal.cursor_x().unwrap(), 1);
+        let row0 = core.terminal.cell_ansi(0, 9, 0).unwrap();
+        assert!(row0.contains("abcdefghi"), "row0: {row0:?}");
+        assert!(row0.contains('J'), "row0: {row0:?}");
+    }
+
+    /// Full-width rows (a TUI's background bars) replay onto the same rows:
+    /// no line breaks after a row that already filled its last column.
+    #[test]
+    fn raw_snapshot_replays_full_width_rows_without_extra_lines() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let bar = "\x1b[48;5;236m                    \x1b[0m";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"before\r\n");
+        bytes.extend_from_slice(bar.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(b"\x1b[48;5;236m> prompt\x1b[K\x1b[0m\r\n");
+        bytes.extend_from_slice(bar.as_bytes());
+        bytes.extend_from_slice(b"\r\nafter");
+        pane.process_pty_bytes(pane_id, 0, &bytes, &tx);
+        let (original_row, original_text) = {
+            let mut core = pane.core.lock().unwrap();
+            let row = core.terminal.cursor_y().unwrap();
+            (
+                row,
+                ghostty_recent_ansi(&mut core, usize::MAX, false).unwrap(),
+            )
+        };
+        assert_eq!(original_row, 4);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = b"\x1b[2J\x1b[H".to_vec();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(
+            format!("\x1b[{};{}H", snapshot.cursor.y + 1, snapshot.cursor.x + 1).as_bytes(),
+        );
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let mut core = restored.core.lock().unwrap();
+        let restored_text = ghostty_recent_ansi(&mut core, usize::MAX, false).unwrap();
+        assert_eq!(
+            restored_text, original_text,
+            "primary: {:?}",
+            snapshot.primary
+        );
+        assert_eq!(core.terminal.cursor_y().unwrap(), original_row);
+        let after = core.terminal.cell_ansi(0, 19, 4).unwrap();
+        assert!(after.contains("after"), "row4: {after:?}");
+    }
+
+    #[test]
+    fn raw_snapshot_preserves_erased_wrap_continuations_and_later_reflow() {
+        for history in [false, true] {
+            for prefix in [
+                format!("{}x\x1b[2K\r\nEND", "a".repeat(80)),
+                format!("{}🙂\x1b[2K\r\nEND", "a".repeat(79)),
+                format!("{}🙂x\x1b[2K\r\nEND", "a".repeat(78)),
+                format!(
+                    "{}\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[4;1HEND",
+                    "a".repeat(240)
+                ),
+            ] {
+                let history_bytes = if history {
+                    format!("{}\x1b[2J\x1b[H", "history\r\n".repeat(30))
+                } else {
+                    String::new()
+                };
+                let source = snapshot_test_pane(format!("{history_bytes}{prefix}").as_bytes());
+                let snapshot = source.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                let restored = replay_test_snapshot(&source, b"stale screen");
+                let cursor = format!("\x1b[{};{}H", snapshot.cursor.y + 1, snapshot.cursor.x + 1);
+                let mut source = source.core.lock().unwrap();
+                let mut restored = restored.core.lock().unwrap();
+                restored.terminal.write(cursor.as_bytes());
+                // Reflow again after replay: inserting plain newlines fixes
+                // the immediate picture but loses soft-wrap state.
+                for cols in [80, 64, 96, 80] {
+                    source.terminal.resize(cols, 24, 0, 0).unwrap();
+                    restored.terminal.resize(cols, 24, 0, 0).unwrap();
+                    let rows = source.terminal.total_rows().unwrap();
+                    assert_eq!(restored.terminal.total_rows().unwrap(), rows);
+                    for y in 0..rows as u32 {
+                        assert_eq!(
+                            restored
+                                .terminal
+                                .read_ansi_screen((0, y), (cols - 1, y), false, false)
+                                .unwrap(),
+                            source
+                                .terminal
+                                .read_ansi_screen((0, y), (cols - 1, y), false, false)
+                                .unwrap(),
+                            "history={history} cols={cols} row={y} input={prefix:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// With history above the screen and blank rows under the content, the
+    /// replay must still land the content on the same screen rows: the
+    /// blank rows are part of the screen, so the snapshot carries them.
+    #[test]
+    fn raw_snapshot_replays_blank_screen_rows_below_the_content() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let mut bytes = Vec::new();
+        for n in 0..12 {
+            bytes.extend_from_slice(format!("history {n}\r\n").as_bytes());
+        }
+        // Clear the screen the way a TUI starts, draw three rows, park the
+        // cursor on the second.
+        bytes.extend_from_slice(b"\x1b[2J\x1b[Hrow0\r\nrow1\r\nrow2\x1b[2;3H");
+        pane.process_pty_bytes(pane_id, 0, &bytes, &tx);
+        let (original_row, original_text) = {
+            let mut core = pane.core.lock().unwrap();
+            let row = core.terminal.cursor_y().unwrap();
+            (row, ghostty_recent_ansi(&mut core, 8, false).unwrap())
+        };
+        assert_eq!(original_row, 1);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = b"\x1b[3J\x1b[2J\x1b[H".to_vec();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(
+            format!("\x1b[{};{}H", snapshot.cursor.y + 1, snapshot.cursor.x + 1).as_bytes(),
+        );
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let mut core = restored.core.lock().unwrap();
+        let restored_text = ghostty_recent_ansi(&mut core, 8, false).unwrap();
+        assert_eq!(
+            restored_text, original_text,
+            "primary: {:?}",
+            snapshot.primary
+        );
+        let row1 = core.terminal.cell_ansi(0, 19, 1).unwrap();
+        assert!(row1.contains("row1"), "row1: {row1:?}");
+        assert_eq!(core.terminal.cursor_y().unwrap(), 1);
+    }
+
+    #[test]
+    fn raw_snapshot_preserves_blank_rows_independently_of_cursor() {
+        for history in [0, 40] {
+            for leading in [0, 2] {
+                for cursor_row in [leading + 1, 11] {
+                    let (tx, _rx) = mpsc::channel(4);
+                    let terminal = crate::ghostty::Terminal::new(40, 24, 100).unwrap();
+                    let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                    let pane_id = PaneId::from_raw(1);
+                    let draw = format!(
+                        "{}\x1b[2J\x1b[H{}before\r\nprompt\r\nafter\x1b[{};3H",
+                        "history\r\n".repeat(history),
+                        "\r\n".repeat(leading),
+                        cursor_row + 1,
+                    );
+                    pane.process_pty_bytes(pane_id, 0, draw.as_bytes(), &tx);
+                    let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                    let original = {
+                        let core = pane.core.lock().unwrap();
+                        (0..24)
+                            .map(|y| core.terminal.cell_ansi(0, 39, y).unwrap())
+                            .collect::<Vec<_>>()
+                    };
+                    let (restored_tx, _restored_rx) = mpsc::channel(4);
+                    let terminal = crate::ghostty::Terminal::new(40, 24, 100).unwrap();
+                    let restored = GhosttyPaneTerminal::new(terminal, restored_tx.clone()).unwrap();
+                    let replay = format!(
+                        "\x1b[3J\x1b[2J\x1b[H{}{}\x1b[{};{}H",
+                        snapshot.primary.as_deref().unwrap(),
+                        snapshot.state_ansi,
+                        snapshot.cursor.y + 1,
+                        snapshot.cursor.x + 1,
+                    );
+                    restored.process_pty_bytes(pane_id, 0, replay.as_bytes(), &restored_tx);
+                    let core = restored.core.lock().unwrap();
+                    let actual = (0..24)
+                        .map(|y| core.terminal.cell_ansi(0, 39, y).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, original,
+                        "history={history} leading={leading} cursor={cursor_row}"
+                    );
+                    assert_eq!(core.terminal.cursor_y().unwrap(), cursor_row as u16);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_preserves_styles_around_empty_cell_gaps() {
+        fn rendered(pane: &GhosttyPaneTerminal) -> ratatui::buffer::Buffer {
+            let backend = ratatui::backend::TestBackend::new(40, 6);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| pane.render(frame, Rect::new(0, 0, 40, 6), false))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        }
+
+        for alternate in [false, true] {
+            for (style, right_style) in [
+                ("48;5;12", "32"),
+                ("48;2;17;34;51", "32"),
+                ("7;4", "32"),
+                ("48;5;12", "48;5;12"),
+                ("48;2;17;34;51", "48;2;17;34;51"),
+                ("7;4", "7;4"),
+            ] {
+                let (tx, _rx) = mpsc::channel(4);
+                let terminal = crate::ghostty::Terminal::new(40, 6, 100).unwrap();
+                let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                let pane_id = PaneId::from_raw(1);
+                let screen = if alternate { "\x1b[?1049h" } else { "" };
+                // Explicitly printed spaces retain the label's style. The
+                // untouched gap before RIGHT must keep the default style.
+                let draw = format!(
+                    "{screen}\x1b[{style}mBAR  \x1b[0m\x1b[1;30H\x1b[{right_style}mRIGHT\x1b[0m\x1b[3;1Hnext\x1b[1;2H"
+                );
+                pane.process_pty_bytes(pane_id, 0, draw.as_bytes(), &tx);
+                let original = rendered(&pane);
+                assert_eq!(original[(5, 0)].style().bg, Some(Color::Reset));
+
+                let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                let (restored_tx, _restored_rx) = mpsc::channel(4);
+                let terminal = crate::ghostty::Terminal::new(40, 6, 100).unwrap();
+                let restored = GhosttyPaneTerminal::new(terminal, restored_tx.clone()).unwrap();
+                let replay = format!(
+                    "\x1b[3J\x1b[2J\x1b[H{}{screen}\x1b[H{}{}\x1b[{};{}H",
+                    snapshot.primary.as_deref().unwrap_or(""),
+                    snapshot.alternate.as_deref().unwrap_or(""),
+                    snapshot.state_ansi,
+                    snapshot.cursor.y + 1,
+                    snapshot.cursor.x + 1,
+                );
+                restored.process_pty_bytes(pane_id, 0, replay.as_bytes(), &restored_tx);
+                let actual = rendered(&restored);
+                // Compare rendered cells, not reserialized ANSI: a formatter
+                // bug can produce the same bad ANSI for source and replay.
+                for y in 0..6 {
+                    for x in 0..40 {
+                        assert_eq!(
+                            (actual[(x, y)].symbol(), actual[(x, y)].style()),
+                            (original[(x, y)].symbol(), original[(x, y)].style()),
+                            "alternate={alternate} style={style} right_style={right_style} cell=({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_preserves_background_only_rows() {
+        fn rendered(pane: &GhosttyPaneTerminal) -> ratatui::buffer::Buffer {
+            let backend = ratatui::backend::TestBackend::new(20, 8);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 8), false))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        }
+
+        fn assert_same(source: &GhosttyPaneTerminal, restored: &GhosttyPaneTerminal, case: &str) {
+            let expected = rendered(source);
+            let actual = rendered(restored);
+            for y in 0..8 {
+                for x in 0..20 {
+                    assert_eq!(
+                        (actual[(x, y)].symbol(), actual[(x, y)].style()),
+                        (expected[(x, y)].symbol(), expected[(x, y)].style()),
+                        "{case} cell=({x},{y})"
+                    );
+                }
+            }
+        }
+
+        for alternate in [false, true] {
+            for history in [false, true] {
+                for style in ["48;5;12", "48;2;17;34;51"] {
+                    for whole_screen in [false, true] {
+                        let case = format!(
+                            "alternate={alternate} history={history} style={style} whole={whole_screen}"
+                        );
+                        let (tx, _rx) = mpsc::channel(4);
+                        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+                        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                        let pane_id = PaneId::from_raw(1);
+                        let bg = format!("\x1b[{style}m");
+                        let mut draw = String::new();
+                        if history {
+                            for n in 0..12 {
+                                draw.push_str(&format!("{bg}\x1b[2K\x1b[0m\r\nhistory {n}\r\n"));
+                            }
+                        }
+                        if alternate {
+                            draw.push_str("\x1b[?1049h");
+                        }
+                        draw.push_str("\x1b[0m\x1b[2J\x1b[H");
+                        if whole_screen {
+                            draw.push_str(&format!("{bg}\x1b[2J\x1b[0m"));
+                        } else {
+                            // Leading, intervening, and trailing background-only
+                            // rows, plus an unstyled row and a partial erased fill.
+                            draw.push_str(&format!(
+                                "{bg}\x1b[2K\x1b[0m\r\n\
+                                 {bg}> 漢e\u{301}\x1b[K\x1b[0m\r\n\
+                                 {bg}\x1b[K\x1b[0m\r\n\r\n\
+                                 \x1b[5;5H{bg}\x1b[8X\x1b[0m\r\n\
+                                 {bg}                    \x1b[0m\r\n\
+                                 label\r\n{bg}\x1b[2K\x1b[0m"
+                            ));
+                        }
+                        draw.push_str("\x1b[2;2H");
+                        pane.process_pty_bytes(pane_id, 0, draw.as_bytes(), &tx);
+                        assert_ne!(rendered(&pane)[(0, 0)].style().bg, Some(Color::Reset));
+
+                        let (restored_tx, _restored_rx) = mpsc::channel(4);
+                        let terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+                        let restored =
+                            GhosttyPaneTerminal::new(terminal, restored_tx.clone()).unwrap();
+                        for _ in 0..2 {
+                            let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                            let screen = if alternate {
+                                "\x1b[?1049h\x1b[2J\x1b[H"
+                            } else {
+                                ""
+                            };
+                            let replay = format!(
+                                "\x1b[?1049l\x1b[0m\x1b[r\x1b[?69l\x1b[?6l\x1b[?7h\x1b[4l\x1b(B\x0f\
+                                 \x1b[3J\x1b[2J\x1b[H{}{screen}{}{}\x1b[{};{}H",
+                                snapshot.primary.as_deref().unwrap_or(""),
+                                snapshot.alternate.as_deref().unwrap_or(""),
+                                snapshot.state_ansi,
+                                snapshot.cursor.y + 1,
+                                snapshot.cursor.x + 1,
+                            );
+                            restored.process_pty_bytes(pane_id, 0, replay.as_bytes(), &restored_tx);
+                            assert_same(&pane, &restored, &case);
+                            let core = restored.core.lock().unwrap();
+                            assert_eq!(core.terminal.cursor_x().unwrap(), snapshot.cursor.x);
+                            assert_eq!(core.terminal.cursor_y().unwrap(), snapshot.cursor.y);
+                            drop(core);
+
+                            if history && !alternate {
+                                pane.scroll_up(100);
+                                restored.scroll_up(100);
+                                assert_same(&pane, &restored, &format!("{case} scrollback"));
+                                pane.scroll_down(100);
+                                restored.scroll_down(100);
+                            }
+                        }
+
+                        // Continuing live output must agree with the original
+                        // terminal, including a new background-only row.
+                        let next = format!("\x1b[8;1H\r\n{bg}\x1b[2K\x1b[0m\r\ncontinued");
+                        pane.process_pty_bytes(pane_id, 0, next.as_bytes(), &tx);
+                        restored.process_pty_bytes(pane_id, 0, next.as_bytes(), &restored_tx);
+                        assert_same(&pane, &restored, &format!("{case} continued"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A wide glyph on the last two columns puts the cursor on its spacer
+    /// tail; the snapshot reprints the whole glyph from one column left.
+    #[test]
+    fn raw_snapshot_pending_wrap_cell_covers_a_wide_glyph() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, "abcdefgh漢".as_bytes(), &tx);
+
+        let snapshot = pane.raw_snapshot(0, 1 << 20, None, None).unwrap();
+        assert!(snapshot.cursor.pending_wrap);
+        assert_eq!(snapshot.cursor.x, 9);
+        let cell = snapshot.cursor.pending_wrap_cell.unwrap();
+        assert!(cell.starts_with("\x1b[D"), "cell: {cell:?}");
+        assert!(cell.contains('漢'), "cell: {cell:?}");
+
+        let (restored_tx, _restored_rx) = mpsc::channel(4);
+        let restored_terminal = crate::ghostty::Terminal::new(10, 4, 0).unwrap();
+        let restored = GhosttyPaneTerminal::new(restored_terminal, restored_tx.clone()).unwrap();
+        let mut replay = Vec::new();
+        replay.extend_from_slice(snapshot.primary.as_deref().unwrap().as_bytes());
+        replay.extend_from_slice(b"\x1b[1;10H\x1b[0m");
+        replay.extend_from_slice(cell.as_bytes());
+        replay.extend_from_slice(b"\x1b[0mK");
+        restored.process_pty_bytes(pane_id, 0, &replay, &restored_tx);
+        let core = restored.core.lock().unwrap();
+        assert_eq!(core.terminal.cursor_y().unwrap(), 1);
+        assert_eq!(core.terminal.cursor_x().unwrap(), 1);
+        let row0 = core.terminal.cell_ansi(0, 9, 0).unwrap();
+        assert!(row0.contains("abcdefgh漢"), "row0: {row0:?}");
     }
 
     #[cfg(windows)]

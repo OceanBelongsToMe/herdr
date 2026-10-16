@@ -46,7 +46,7 @@ impl App {
                 self.handle_api_worktree_read_finished(*result);
                 changes_workspace
             }
-            ev @ AppEvent::TerminalBell { .. } => {
+            ev @ (AppEvent::TerminalBell { .. } | AppEvent::ForegroundProcessChanged { .. }) => {
                 self.handle_internal_event(ev);
                 false
             }
@@ -148,6 +148,11 @@ impl App {
             if let Some(ws_idx) = changed_workspace {
                 self.emit_workspace_updated(ws_idx);
             }
+            return Vec::new();
+        }
+
+        if let AppEvent::ForegroundProcessChanged { pane_id, process } = ev {
+            self.sync_foreground_process(pane_id, process);
             return Vec::new();
         }
 
@@ -1255,6 +1260,22 @@ impl App {
             }
             Method::PluginPaneClose(params) => {
                 return self.handle_plugin_pane_close(request.id, params);
+            }
+            Method::ControlOpen(_)
+            | Method::ControlClose(_)
+            | Method::TerminalAttach(_)
+            | Method::TerminalDetach(_)
+            | Method::TerminalInput(_)
+            | Method::TerminalSnapshot(_)
+            | Method::TerminalResize(_)
+            | Method::TabSetGeometry(_)
+            | Method::TabClaimGeometry(_)
+            | Method::ControlList(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "control_stream_required",
+                    "this method is only available on a control stream served by the headless server",
+                );
             }
             _ => {
                 return responses::encode_error(

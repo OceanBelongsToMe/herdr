@@ -582,6 +582,18 @@ Herdr に保存されたネイティブセッション参照があるとき、`p
 
 `pane.get`、`pane.list`、`agent.get`、`agent.list` は、ペインの PTY を現在制御しているプロセスの cwd を解決できるときに `foreground_cwd` も公開します。既存の `cwd` フィールドは、ラベル、follow-cwd 挙動、復元されたセッション状態に使われるペイン/ワークスペースの cwd のままです。
 
+`PaneInfo` は、ペインのフォアグラウンドジョブを表す任意の `foreground_process` オブジェクトも公開します。`name` はジョブリーダーの実行ファイル名 (ログインシェルの先頭の `-` を除いたもの)、`argv` は先頭から最大 16 個、各 256 バイトまでの引数、`is_shell` はジョブリーダーがペイン自身のシェルプロセスで、プロンプトを表示しているときに true です。これは Herdr がペイン用に起動した対話シェル (起動時の引数のまま)、またはスクリプトや `-c` オペランドを持たないシェルを指します。ペインの起動コマンドとして実行されたプログラムや、シェルが `exec` で置き換わったプログラムは `false` になります。いずれかが変わると Herdr は `pane.updated` を発行します。Herdr がペインのフォアグラウンドジョブをまだ調べていない場合、このフィールドは省略されます。Windows では一般的なフォアグラウンドジョブを特定できないため、常に省略されます。
+
+```json
+{
+  "foreground_process": {
+    "name": "htop",
+    "argv": ["htop", "-d", "5"],
+    "is_shell": false
+  }
+}
+```
+
 `PaneInfo` と `AgentInfo` は、任意の `terminal_title` と `terminal_title_stripped` フィールドを公開します。`terminal_title` は、安全性のための正規化を行った最新の OSC 0/2 タイトルです。`terminal_title_stripped` は、先頭にある認識済みのアクティビティまたはスピナーのグリフ 1 つと、それに続く空白を除去します。これらはサーバーが所有する値で、コールドリスタートをまたいで保持されず、メタデータの `title` や意味的なエージェント状態から独立しています。
 
 ユーザーフックが Herdr インテグレーションからライフサイクル状態を奪わずに表示をカスタマイズしたいときは `pane.report_metadata` を使ってください。
@@ -658,12 +670,35 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。
-ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
+ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`foreground_process` が変わったときも `pane.updated` を発行します。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
 レイアウトのイベント購読には `layout.updated` があります。このイベントは 1 つのタブについて更新済みの `PaneLayoutSnapshot` を運びます。`session.snapshot` でキャッシュを管理するクライアントは、このイベントを契機にサーバーから対象のレイアウトを再取得してください。遅れて届いたペイロードは、最新のスナップショットより古い可能性があります。
 
 worktree のイベント購読には `worktree.created`、`worktree.opened`、`worktree.removed` があります。worktree イベントは Git チェックアウトのライフサイクルを記述します。`worktree.created` は開かれた `workspace` と作成された `worktree` を含みます。`worktree.opened` は対象の `workspace`、開かれた `worktree`、`already_open` を含みます。`worktree.removed` は `workspace_id`、削除された `worktree`、`forced` を含みます。
 
 ライフサイクルイベントには `events.subscribe` を使ってください。ワンショットの wait がサポートされる場合、専用の wait ヘルパーが別途ドキュメント化されます。
+
+## コントロールストリーム
+
+コントロールストリームは、クライアントがターミナルエミュレータのように Herdr を操作するために開き続ける 1 本の接続です。通常のリクエスト、イベント購読、そしてクライアント自身が描画するペインの生のターミナル出力を多重化します。対応するサーバーは `ping` の capabilities で `terminal_control_stream`（現在は `1`）を公開し、`herdr control` はストリームを stdin と stdout に橋渡しするので、PTY なしの SSH exec チャネルでも運べます。
+
+新しい接続の最初のリクエストとして `control.open` を送ってストリームを開きます。レスポンスにはサーバーの `boot_id`、`connection_id`、バージョン、プロトコル、capabilities が含まれます。以降の行はすべてリクエストで、レスポンス、プッシュされる購読イベント、ターミナルレコードは 1 つの順序でソケットを共有します。`events.subscribe` は接続を占有せず同じ接続に購読を追加し、`ping` はローカルで応答します。ブロックするヘルパー（`events.wait`、`agent.wait`、`agent.prompt`、`pane.wait_for_output`）と `pane.graphics.stream` は `unsupported_in_control_stream` で拒否されるため、別の接続を使ってください。`control.close` または接続の切断で、ストリームが所有していたものをすべて解放します。
+
+```json
+{"id":"c","method":"control.open","params":{}}
+{"id":"a","method":"terminal.attach","params":{"target":"w1:p1","answer_queries":"client","history_limit_bytes":1048576}}
+{"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40,"cell_width_px":8,"cell_height_px":16}}
+{"id":"i","method":"terminal.input","params":{"attach_id":"1-0","bytes":"bHMK"}}
+{"id":"s","method":"terminal.snapshot","params":{"attach_id":"1-0"}}
+{"id":"d","method":"terminal.detach","params":{"attach_id":"1-0"}}
+```
+
+`terminal.attach` はペイン ID、ターミナル ID、またはエージェント名を受け取り、直接アタッチと同様にストリームをそのターミナルの書き込み可能な所有者にします。別の所有者を追い出すには `takeover: true` を渡します。レスポンスには `attach_id` が含まれ、その最初のレコードは `terminal.snapshot` です。アクティブ画面の ANSI（折り返しを解除したスクロールバックを含む `primary`、または `alternate`）、ターミナル状態を復元するシーケンス（モード、スクロール領域、タブストップ、文字集合、アクティブなペン、そしてプッシュされた Kitty スタックを含むキーボードプロトコル）を含む `state_ansi`、アクティブなペンだけを含む `pen_ansi`、カーソル、そして同じ事実をフィールドとして持つ `state` オブジェクトで構成されます。印字の後に最終列に留まっているカーソルは `pending_wrap` と `pending_wrap_cell` を報告します。後者はその位置から再印字するスタイル付きのセルで、クライアントのターミナルがサーバーと同じように次の文字を折り返すためのものです。PTY の読み取りが途中で終わったエスケープシーケンスは、スナップショットの直後に最初の `terminal.output` レコードとして続くため、クライアントは完全な形で解析できます。スナップショットはペインの出力ロックの下で取得されるため、より大きい `seq` を持つ `terminal.output` レコードはすべてその後に生成されたものです。`history_limit_bytes` はプライマリ履歴を制限し（既定 1 MiB、最大 8 MiB）、`truncated` は切り詰めを報告します。代替画面がアクティブな間はその画面のみを取得します。
+
+`terminal.output` は生の PTY バイトを base64 で、アタッチごとの `seq` とともに運びます。クライアントが遅れるとサーバーは出力を破棄して `terminal.gap` を送るので、`terminal.snapshot` をリクエストして再同期してください。現在の `seq` を刻印した新しい `terminal.snapshot` が発行されます。`pane.clear` のように PTY 出力なしで画面が変わる場合も、サーバーはリクエストなしで `terminal.snapshot` を送ります。`terminal.input` は、ブラケットペーストのラッパーやクライアントのエミュレータが生成したマウス・フォーカスレポートを含め、バイトをそのまま PTY に書き込みます。`terminal.detached` は `takeover` または `closed` を報告します。レコードの形式はバンドルされたスキーマの `schemas.control_record` にあります。
+
+`answer_queries` は、デバイス属性、XTGETTCAP、OSC カラークエリにどちらのエミュレータが応答するかを決めます。`client`（既定）では、アタッチがターミナルを所有している間 Herdr は自身の応答を抑制し、ちょうど 1 つのエミュレータだけが応答します。`server` では Herdr が通常どおり応答します。
+
+サイズは既定でタブレイアウトに従います。`tab.set_geometry` でタブを要求すると、Herdr は要求した領域でタブをレイアウトします。`chrome: "none"` を渡すと、Herdr の境界線、間隔、スクロールバーのガターなしでタブをレイアウトするため、ペインの矩形が領域をぴったり敷き詰め、クライアントが自前の区切り線を描けます。既定の `server` は設定済みのクロームを保ちます。コントロールストリームが開いている間は、どのクライアントが引き起こしたジオメトリ変更でも、ターミナルのサイズ変更前に `tab.layout` レコードがストリームに送られます。このレコードはタブの `PaneLayoutSnapshot` を運び、各ペインの矩形には、境界線、ガター、ズームを適用した後にターミナルが実際にサイズ設定される内側の領域が入ります。レコードは `terminal.output` と同じ順序付きレーンを共有するため、クライアントは新しいサイズで描画された再描画を受け取る前に、必ず新しい矩形を持っています。`session.snapshot` のレイアウトはサーバーの共有ビュー領域と外側のペイン矩形を使うため、タブの最初の `tab.layout` が届くまではトポロジーとして扱ってください。この要求はタブを表示している Herdr クライアントと同じ規則に従うため、最後に操作したクライアントが優先されます。`geometry: "terminal"` のアタッチは代わりに `terminal.resize` で 1 つのターミナルのサイズを決め、タブレイアウトをそのターミナルから締め出します。デタッチすると、タブのジオメトリコントローラーが再びそのターミナルのサイズを決めます。
 
 ## ペインの読み取り
 

@@ -205,6 +205,9 @@ mod tests {
             "plugin.pane.open",
             "plugin.pane.focus",
             "plugin.pane.close",
+            "tab.set_geometry",
+            "tab.set_pane_geometry",
+            "tab.claim_geometry",
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();

@@ -30,6 +30,7 @@ mod cursor;
 mod input;
 mod kitty_keyboard;
 mod osc;
+pub(crate) mod raw_stream;
 mod state;
 mod terminal;
 mod xtgettcap;
@@ -42,9 +43,10 @@ use self::agent_detection::{
     ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::background_agent::{AgentJobStatus, AgentJobTracker};
+use self::raw_stream::{RawInputSink, RawTapBudget, RawTapRegistry};
 #[cfg(test)]
 pub(crate) use self::terminal::test_encode_key_for_app;
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
@@ -225,11 +227,13 @@ struct PendingAgentRelease {
     until: std::time::Instant,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Launch argv of herdr's interactive pane shell; None for requested commands.
+    pane_shell_argv: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -800,6 +804,7 @@ struct ProcessProbeResult {
     /// The process that identified as `agent`, which need not lead its job.
     agent_pid: Option<u32>,
     process_name: Option<String>,
+    foreground_job: Option<crate::platform::ForegroundJob>,
 }
 
 fn agent_hint_for_foreground_job_members(
@@ -846,6 +851,7 @@ fn process_probe_result(
         agent: Some(agent),
         agent_pid: Some(agent_pid),
         process_name: Some(process_name),
+        foreground_job: Some(job.clone()),
     }
 }
 
@@ -901,6 +907,7 @@ fn probe_foreground_process_from_jobs(
             agent: None,
             agent_pid: None,
             process_name: None,
+            foreground_job: foreground_job.clone(),
         };
     }
 
@@ -910,6 +917,121 @@ fn probe_foreground_process_from_jobs(
         agent: None,
         agent_pid: None,
         process_name: None,
+        foreground_job: None,
+    }
+}
+
+const FOREGROUND_PROCESS_MAX_ARGS: usize = 16;
+const FOREGROUND_PROCESS_MAX_ARG_BYTES: usize = 256;
+
+fn foreground_process_info(
+    job: &crate::platform::ForegroundJob,
+    shell_pid: u32,
+    pane_shell_argv: Option<&[String]>,
+) -> Option<crate::api::schema::ForegroundProcessInfo> {
+    let process = job
+        .processes
+        .iter()
+        .find(|process| process.pid == job.process_group_id)
+        .or_else(|| job.processes.first())?;
+    let name = foreground_process_name(process);
+    let is_shell = process.pid == shell_pid
+        && is_known_shell_name(&name)
+        && process
+            .argv
+            .as_deref()
+            .is_some_and(|argv| pane_shell_argv == Some(argv) || shell_argv_has_no_operands(argv));
+    let argv = process.argv.as_deref().unwrap_or_default();
+    Some(crate::api::schema::ForegroundProcessInfo {
+        name,
+        argv: argv
+            .iter()
+            .take(FOREGROUND_PROCESS_MAX_ARGS)
+            .map(|arg| arg[..arg.floor_char_boundary(FOREGROUND_PROCESS_MAX_ARG_BYTES)].to_string())
+            .collect(),
+        is_shell,
+    })
+}
+
+fn is_known_shell_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "zsh"
+            | "fish"
+            | "nu"
+            | "sh"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "mksh"
+            | "oksh"
+            | "loksh"
+            | "ksh93"
+            | "tcsh"
+            | "csh"
+            | "yash"
+            | "elvish"
+            | "xonsh"
+            | "pwsh"
+            | "powershell"
+    )
+}
+
+// A shell given a script or `-c` command is running it, not sitting at a prompt.
+fn shell_argv_has_no_operands(argv: &[String]) -> bool {
+    argv.iter().skip(1).all(|arg| arg.starts_with('-'))
+}
+
+// Windows only selects agents or the shell, so it has no general foreground job to report.
+fn published_foreground_process(
+    probe: &ProcessProbeResult,
+    shell_pid: u32,
+    pane_shell_argv: Option<&[String]>,
+) -> Option<crate::api::schema::ForegroundProcessInfo> {
+    if cfg!(windows) {
+        return None;
+    }
+    probe
+        .foreground_job
+        .as_ref()
+        .and_then(|job| foreground_process_info(job, shell_pid, pane_shell_argv))
+}
+
+// Linux reports no argv0 and truncates the process name, so argv[0] comes next.
+fn foreground_process_name(process: &crate::platform::ForegroundProcess) -> String {
+    let argv0 = process.argv.as_ref().and_then(|argv| argv.first());
+    [process.argv0.as_deref(), argv0.map(String::as_str)]
+        .into_iter()
+        .flatten()
+        .chain(std::iter::once(process.name.as_str()))
+        .find_map(|raw| {
+            let base = std::path::Path::new(raw).file_name()?.to_str()?;
+            let base = base.strip_prefix('-').unwrap_or(base);
+            (!base.is_empty()).then(|| base.to_string())
+        })
+        .unwrap_or_else(|| process.name.clone())
+}
+
+async fn publish_foreground_process(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    process: Option<crate::api::schema::ForegroundProcessInfo>,
+    last_published: &mut Option<Option<crate::api::schema::ForegroundProcessInfo>>,
+) {
+    if last_published.as_ref() == Some(&process) {
+        return;
+    }
+    *last_published = Some(process.clone());
+    if let Err(e) = state_events
+        .send(AppEvent::ForegroundProcessChanged { pane_id, process })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver ForegroundProcessChanged event"
+        );
     }
 }
 
@@ -929,6 +1051,7 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 fn spawn_basic_detection_task(
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
+    pane_shell_argv: Option<Vec<String>>,
     terminal: Arc<PaneTerminal>,
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
@@ -967,6 +1090,7 @@ fn spawn_basic_detection_task(
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
         let mut agent_job = AgentJobTracker::default();
+        let mut last_foreground_process = None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -1055,6 +1179,13 @@ fn spawn_basic_detection_task(
                 let had_process_probe = has_process_probe;
                 has_process_probe = true;
                 let probe = probe_foreground_process(pid, foreground_pgid);
+                publish_foreground_process(
+                    &state_events,
+                    pane_id,
+                    published_foreground_process(&probe, pid, pane_shell_argv.as_deref()),
+                    &mut last_foreground_process,
+                )
+                .await;
                 let process_group_id = probe.process_group_id;
                 let tracked_process_group_id =
                     process_group_for_change_tracking(foreground_pgid, process_group_id);
@@ -1510,12 +1641,19 @@ pub struct PaneRuntime {
     kitty_keyboard_flags: Arc<AtomicU16>,
     content_seq: Arc<AtomicU64>,
     content_write_lock: Arc<Mutex<()>>,
+    /// Set while `hold_content_write_lock` is live on the app thread.
+    content_lock_held: Cell<bool>,
     detection_content_seq: Arc<AtomicU64>,
+    /// Control-stream output taps; published under `content_write_lock`.
+    raw_taps: Arc<RawTapRegistry>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    /// Launched as herdr's interactive pane shell; carried across handoff.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pane_shell_argv: Option<Vec<String>>,
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
@@ -1697,6 +1835,18 @@ pub enum WheelRouting {
     HostScroll,
     MouseReport,
     AlternateScroll,
+}
+
+/// A held content write lock; see `PaneRuntime::hold_content_write_lock`.
+pub(crate) struct ContentWriteHold<'a> {
+    runtime: &'a PaneRuntime,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for ContentWriteHold<'_> {
+    fn drop(&mut self) {
+        self.runtime.content_lock_held.set(false);
+    }
 }
 
 impl Drop for PaneRuntime {
@@ -2155,6 +2305,24 @@ fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<C
     pane_shell_command_builder_for_target(shell_config, ShellLaunchTarget::current())
 }
 
+// Mirrors portable-pty's exec: a default-program builder runs `$SHELL` with argv0 `-<basename>`.
+fn command_builder_exec_argv(cmd: &CommandBuilder) -> Option<Vec<String>> {
+    if cmd.is_default_prog() {
+        #[cfg(unix)]
+        {
+            let shell = cmd.get_shell();
+            let basename = shell.rsplit('/').next().unwrap_or(&shell);
+            return Some(vec![format!("-{basename}")]);
+        }
+        #[cfg(not(unix))]
+        return None;
+    }
+    cmd.get_argv()
+        .iter()
+        .map(|arg| arg.to_str().map(str::to_string))
+        .collect()
+}
+
 /// True when panes launch an interactive PowerShell directly on Windows.
 /// Gates the prompt-based cwd reporting pipeline and the agent-exit shell
 /// respawn recovery.
@@ -2311,6 +2479,7 @@ impl PaneRuntime {
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
             agent_state: None,
+            pane_shell_argv: self.pane_shell_argv.clone(),
         }
     }
 
@@ -2392,6 +2561,7 @@ impl PaneRuntime {
         cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
+        let pane_shell_argv = command_builder_exec_argv(&cmd);
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2408,6 +2578,7 @@ impl PaneRuntime {
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
                 windows_powershell_prompt_cwd_reporting,
+                pane_shell_argv,
             },
             AgentDetection::Enabled,
         )
@@ -2522,6 +2693,7 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
             agent_state: _,
+            pane_shell_argv,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -2563,6 +2735,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let raw_taps = Arc::new(RawTapRegistry::default());
 
         let io = {
             let terminal = terminal.clone();
@@ -2572,6 +2745,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let raw_taps = raw_taps.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2587,6 +2761,15 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                raw_taps.note_read(bytes);
+                if raw_taps.has_taps() {
+                    raw_taps.publish(bytes);
+                }
+                let terminal_responses = if raw_taps.suppress_terminal_responses() {
+                    Vec::new()
+                } else {
+                    result.terminal_responses
+                };
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
@@ -2620,9 +2803,7 @@ impl PaneRuntime {
                         );
                     }
                 }
-                PtyReadResult {
-                    terminal_responses: result.terminal_responses,
-                }
+                PtyReadResult { terminal_responses }
             });
             let exit_events = events.clone();
             let cwd_process_exited = cwd_process_exited.clone();
@@ -2650,6 +2831,7 @@ impl PaneRuntime {
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
+            pane_shell_argv.clone(),
             terminal.clone(),
             content_seq.clone(),
             detection_content_seq.clone(),
@@ -2671,12 +2853,15 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            content_lock_held: Cell::new(false),
             detection_content_seq,
+            raw_taps,
             full_lifecycle_authority_active,
             self_reported_agent_active,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            pane_shell_argv,
             compression,
             detect_handle: Some(detect_handle),
         })
@@ -2732,6 +2917,7 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let raw_taps = Arc::new(RawTapRegistry::default());
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
         {
@@ -2776,6 +2962,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let raw_taps = raw_taps.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2790,6 +2977,15 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                raw_taps.note_read(bytes);
+                if raw_taps.has_taps() {
+                    raw_taps.publish(bytes);
+                }
+                let terminal_responses = if raw_taps.suppress_terminal_responses() {
+                    Vec::new()
+                } else {
+                    result.terminal_responses
+                };
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
@@ -2825,9 +3021,7 @@ impl PaneRuntime {
                         );
                     }
                 }
-                PtyReadResult {
-                    terminal_responses: result.terminal_responses,
-                }
+                PtyReadResult { terminal_responses }
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
                 pane_id: pane_id.raw(),
@@ -2864,6 +3058,7 @@ impl PaneRuntime {
             let detect_reset_notify = Arc::new(Notify::new());
             let detect_reset = detect_reset_notify.clone();
             let pending_release = Arc::new(Mutex::new(None));
+            let pane_shell_argv = initial_state.pane_shell_argv.clone();
             let pending_release_for_task = pending_release.clone();
 
             let handle = tokio::spawn(async move {
@@ -2892,6 +3087,7 @@ impl PaneRuntime {
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
                 let mut agent_job = AgentJobTracker::default();
+                let mut last_foreground_process = None;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -3018,6 +3214,17 @@ impl PaneRuntime {
                         has_process_probe = true;
                         if pid > 0 {
                             let probe = probe_foreground_process(pid, foreground_pgid);
+                            publish_foreground_process(
+                                &state_events,
+                                pane_id,
+                                published_foreground_process(
+                                    &probe,
+                                    pid,
+                                    pane_shell_argv.as_deref(),
+                                ),
+                                &mut last_foreground_process,
+                            )
+                            .await;
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;
                             let tracked_process_group_id = process_group_for_change_tracking(
@@ -3284,12 +3491,15 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            content_lock_held: Cell::new(false),
             detection_content_seq,
+            raw_taps,
             full_lifecycle_authority_active,
             self_reported_agent_active,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            pane_shell_argv: initial_state.pane_shell_argv,
             compression,
             detect_handle,
         })
@@ -3346,16 +3556,29 @@ impl PaneRuntime {
             return;
         }
         self.current_size.set(size);
-        let _content_write_guard = match self.content_write_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        let content_write_guard = if self.content_lock_held.get() {
+            None
+        } else {
+            Some(match self.content_write_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            })
         };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
-        let terminal_responses = self
-            .terminal
-            .resize(rows, cols, cell_width_px, cell_height_px);
+        // A raw-tap client replays this byte stream itself: the model must
+        // stay a pure function of it, so no recovery text is written back.
+        let mut terminal_responses = if self.raw_taps.has_taps() {
+            self.terminal
+                .resize_exact(rows, cols, cell_width_px, cell_height_px)
+        } else {
+            self.terminal
+                .resize(rows, cols, cell_width_px, cell_height_px)
+        };
+        if self.raw_taps.suppress_terminal_responses() {
+            terminal_responses.clear();
+        }
         self.content_seq.fetch_add(1, Ordering::Release);
-        drop(_content_write_guard);
+        drop(content_write_guard);
         self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
         self.io.resize(
@@ -3394,6 +3617,13 @@ impl PaneRuntime {
         self.content_seq.fetch_add(1, Ordering::AcqRel);
         let result = self.terminal.clear_screen();
         self.content_seq.fetch_add(1, Ordering::Release);
+        if result.is_ok() && self.raw_taps.has_taps() {
+            // The clear writes no PTY output, so raw clients would keep
+            // showing what it removed.
+            self.raw_taps.resnapshot_armed(|seq, history_limit_bytes| {
+                self.raw_snapshot_locked(seq, history_limit_bytes)
+            });
+        }
         drop(guard);
         self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
@@ -3689,6 +3919,112 @@ impl PaneRuntime {
         }
     }
 
+    /// Input sink a control stream can write to without the app loop.
+    pub(crate) fn raw_input_sink(&self) -> RawInputSink {
+        match &self.io {
+            PaneRuntimeIo::Actor(actor) => RawInputSink::Actor(actor.clone()),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => RawInputSink::Channel(sender.clone()),
+        }
+    }
+
+    /// Register a raw output tap under the content write lock. Follow it
+    /// with `snapshot_raw`; the snapshot is taken under the same lock, so
+    /// every byte processed afterwards reaches the tap with a higher
+    /// sequence than the snapshot carries. Query suppression starts with
+    /// that snapshot, not here.
+    pub(crate) fn attach_raw(
+        &self,
+        attach_id: String,
+        outbound: crate::api::control::ControlOutboundSender,
+        budget: Arc<RawTapBudget>,
+        suppress_terminal_responses: bool,
+        protocol: u32,
+    ) {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps.insert(
+            attach_id,
+            outbound,
+            budget,
+            suppress_terminal_responses,
+            protocol,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_query_authority_for_test(&self) -> Option<String> {
+        self.raw_taps.authority_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suppresses_terminal_responses_for_test(&self) -> bool {
+        self.raw_taps.suppress_terminal_responses()
+    }
+
+    /// Picks the tap that answers queries, under the lock so a read in
+    /// flight sees one consistent answer.
+    pub(crate) fn set_raw_query_authority(&self, attach_id: Option<&str>) {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps.set_authority(attach_id);
+    }
+
+    /// Emit a snapshot on a live tap, ordered against output.
+    pub(crate) fn snapshot_raw(&self, attach_id: &str, history_limit_bytes: usize) -> bool {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps
+            .send_snapshot(attach_id, history_limit_bytes, |seq| {
+                self.raw_snapshot_locked(seq, history_limit_bytes)
+            })
+    }
+
+    pub(crate) fn detach_raw(
+        &self,
+        attach_id: &str,
+        reason: crate::api::schema::TerminalDetachReason,
+    ) -> bool {
+        // Under the lock so a read in flight answers a query exactly once:
+        // either here or on the client, never neither.
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.raw_taps.remove(attach_id, reason)
+    }
+
+    /// Holds the content write lock across a layout change so a
+    /// `tab.layout` record and the resizes behind it form one boundary
+    /// against PTY reads; `resize` reuses the held lock meanwhile.
+    pub(crate) fn hold_content_write_lock(&self) -> ContentWriteHold<'_> {
+        let guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.content_lock_held.set(true);
+        ContentWriteHold {
+            runtime: self,
+            _guard: guard,
+        }
+    }
+
+    fn raw_snapshot_locked(
+        &self,
+        seq: u64,
+        history_limit_bytes: usize,
+    ) -> Option<crate::api::schema::TerminalSnapshot> {
+        let cwd = self.cwd().map(|path| path.to_string_lossy().into_owned());
+        self.terminal
+            .raw_snapshot(seq, history_limit_bytes, self.terminal_title(), cwd)
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -3928,6 +4264,7 @@ impl PaneRuntime {
         let (handle, reset, release) = spawn_basic_detection_task(
             self.pane_id,
             self.child_pid.clone(),
+            None,
             self.terminal.clone(),
             self.content_seq.clone(),
             self.detection_content_seq.clone(),
@@ -4027,6 +4364,10 @@ impl PaneRuntime {
         self.content_seq.fetch_add(1, Ordering::AcqRel);
         let (tx, _rx) = mpsc::channel(1);
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
+        self.raw_taps.note_read(bytes);
+        if self.raw_taps.has_taps() {
+            self.raw_taps.publish(bytes);
+        }
         self.content_seq.fetch_add(1, Ordering::Release);
         self.compression.wake();
     }
@@ -4077,12 +4418,15 @@ impl PaneRuntime {
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 content_seq: Arc::new(AtomicU64::new(0)),
                 content_write_lock: Arc::new(Mutex::new(())),
+                content_lock_held: Cell::new(false),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                raw_taps: Arc::new(RawTapRegistry::default()),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 self_reported_agent_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                pane_shell_argv: None,
                 compression,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -4278,6 +4622,236 @@ mod tests {
             .text
             .contains("one"));
         assert!(runtime.visible_text().contains("five"));
+    }
+
+    #[tokio::test]
+    async fn clear_pane_resnapshots_armed_raw_taps() {
+        use crate::api::control::ControlOutbound;
+
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"old\r\nold\r\n$ ");
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw(
+            "1-0".into(),
+            tx.clone(),
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            2,
+        );
+        let (unarmed_tx, unarmed_rx) = std::sync::mpsc::channel();
+        runtime.attach_raw(
+            "1-1".into(),
+            unarmed_tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            2,
+        );
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        runtime.test_process_pty_bytes(b"typed");
+        let _ = rx.try_iter().count();
+
+        runtime.clear_screen().unwrap();
+        match rx.try_iter().collect::<Vec<_>>().as_slice() {
+            [ControlOutbound::Snapshot {
+                attach_id,
+                snapshot,
+            }] => {
+                assert_eq!(attach_id, "1-0");
+                assert_eq!(snapshot.seq, 1, "stamped after the streamed output");
+                let primary = snapshot.primary.as_deref().unwrap_or_default();
+                assert!(primary.contains("$ typed"), "snapshot: {primary:?}");
+                assert!(!primary.contains("old"), "snapshot: {primary:?}");
+            }
+            other => panic!("expected one snapshot after clear, got {other:?}"),
+        }
+        assert!(
+            unarmed_rx.try_recv().is_err(),
+            "a tap awaiting its first snapshot stays silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_attach_orders_snapshot_before_output_and_suppresses_replies() {
+        use crate::api::control::ControlOutbound;
+        use crate::api::schema::TerminalDetachReason;
+
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hello\r\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw(
+            "1-0".into(),
+            tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            1,
+        );
+        runtime.set_raw_query_authority(Some("1-0"));
+        // Output before the first snapshot never streams: the snapshot covers
+        // it, so the server still answers queries in that window.
+        assert!(!runtime.raw_taps.suppress_terminal_responses());
+        runtime.test_process_pty_bytes(b"early ");
+        assert!(rx.try_recv().is_err(), "unarmed tap must stay silent");
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        assert!(runtime.raw_taps.suppress_terminal_responses());
+
+        runtime.test_process_pty_bytes(b"world");
+        let records = rx.try_iter().collect::<Vec<_>>();
+        match &records[0] {
+            ControlOutbound::Snapshot { snapshot, .. } => {
+                assert_eq!(snapshot.seq, 0);
+                let primary = snapshot.primary.as_deref().unwrap_or_default();
+                assert!(primary.contains("hello"), "snapshot: {primary:?}");
+                assert!(primary.contains("early"), "snapshot: {primary:?}");
+                assert!(!primary.contains("world"));
+                assert_eq!(snapshot.state.cols, 20);
+                assert!(!snapshot.state_ansi.contains("2026"));
+                assert!(!snapshot.state_ansi.contains("1049"));
+                assert!(
+                    snapshot.state_ansi.contains("\x1b[?7h"),
+                    "autowrap replayed"
+                );
+                assert!(
+                    !snapshot.state_ansi.contains("hello"),
+                    "state carries no screen content: {:?}",
+                    snapshot.state_ansi
+                );
+            }
+            other => panic!("expected snapshot first, got {other:?}"),
+        }
+        match &records[1] {
+            ControlOutbound::Output { seq, bytes, .. } => {
+                assert_eq!(*seq, 1);
+                assert_eq!(&bytes[..], b"world");
+            }
+            other => panic!("expected output second, got {other:?}"),
+        }
+
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        match rx.try_recv() {
+            Ok(ControlOutbound::Snapshot { snapshot, .. }) => {
+                assert_eq!(snapshot.seq, 1);
+                assert!(snapshot
+                    .primary
+                    .as_deref()
+                    .is_some_and(|primary| primary.contains("world")));
+            }
+            other => panic!("expected a re-snapshot, got {other:?}"),
+        }
+
+        assert!(runtime.detach_raw("1-0", TerminalDetachReason::Closed));
+        assert!(!runtime.raw_taps.suppress_terminal_responses());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ControlOutbound::Detached {
+                reason: TerminalDetachReason::Closed,
+                ..
+            })
+        ));
+    }
+
+    /// A read that ends inside `ESC [` leaves the parser mid-sequence; the
+    /// snapshot replays those bytes so `6n` on the next read is a query on
+    /// the client too, which now owns the answer.
+    #[tokio::test]
+    async fn raw_snapshot_replays_a_split_escape_sequence() {
+        use crate::api::control::ControlOutbound;
+
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hi");
+        runtime.test_process_pty_bytes(b"\x1b[");
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw(
+            "1-0".into(),
+            tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            1,
+        );
+        runtime.set_raw_query_authority(Some("1-0"));
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        runtime.test_process_pty_bytes(b"6n");
+
+        let records = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(records[0], ControlOutbound::Snapshot { .. }));
+        match (&records[1], &records[2]) {
+            (
+                ControlOutbound::Output { bytes: head, .. },
+                ControlOutbound::Output { bytes: tail, .. },
+            ) => {
+                assert_eq!(&head[..], b"\x1b[");
+                assert_eq!(&tail[..], b"6n");
+            }
+            other => panic!("expected the pending tail then the read, got {other:?}"),
+        }
+    }
+
+    /// A layout boundary holds the content lock across `resize`, which must
+    /// reuse it instead of blocking on itself.
+    #[tokio::test]
+    async fn resize_reuses_a_held_content_lock() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"hello\r\n");
+        let hold = runtime.hold_content_write_lock();
+        runtime.resize(10, 40, 0, 0);
+        assert_eq!(runtime.current_size.get(), (10, 40, 0, 0));
+        assert!(
+            runtime.content_write_lock.try_lock().is_err(),
+            "the hold keeps the lock until it drops"
+        );
+        drop(hold);
+        assert!(runtime.content_write_lock.try_lock().is_ok());
+        runtime.resize(12, 50, 0, 0);
+        assert_eq!(runtime.current_size.get(), (12, 50, 0, 0));
+    }
+
+    /// With a raw tap the model must stay a pure function of the byte
+    /// stream: a resize is exactly libghostty's reflow, with no recovery
+    /// text written back that the tap client never received.
+    #[tokio::test]
+    async fn resize_with_a_raw_tap_matches_a_bare_terminal_resize() {
+        let screen = b"line1\r\nline2\r\nline3\r\n";
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, screen);
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw(
+            "1-0".into(),
+            tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            1,
+        );
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        let _ = rx.try_iter().count();
+
+        // Growing the screen leaves the bottom blank, which is exactly when
+        // the recovery replay would rewrite recent lines into the model.
+        runtime.resize(40, 20, 0, 0);
+
+        let mut bare = crate::ghostty::Terminal::new(20, 5, 10_000).expect("terminal");
+        bare.write(screen);
+        bare.resize(20, 40, 0, 0).expect("resize");
+        assert_eq!(
+            runtime.terminal.ghostty.recent_text_raw(40),
+            super::terminal::recent_text_for_test(&bare, 40)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a resize publishes nothing to the tap"
+        );
+    }
+
+    #[test]
+    fn history_tail_truncation_cuts_on_a_line_boundary() {
+        let (kept, truncated) =
+            super::terminal::truncate_history_tail_for_test("one\ntwo\nthree\n".into(), 9);
+        assert!(truncated);
+        assert_eq!(kept, "three\n");
+        let (kept, truncated) = super::terminal::truncate_history_tail_for_test("ab".into(), 9);
+        assert!(!truncated);
+        assert_eq!(kept, "ab");
+        // A limit landing inside a multibyte character must not panic.
+        let (kept, truncated) =
+            super::terminal::truncate_history_tail_for_test("日本語\n語\n".into(), 5);
+        assert!(truncated);
+        assert_eq!(kept, "語\n");
+        let (kept, truncated) = super::terminal::truncate_history_tail_for_test("日本語".into(), 4);
+        assert!(truncated);
+        assert_eq!(kept, "語");
     }
 
     #[tokio::test]
@@ -5430,11 +6004,14 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            content_lock_held: Cell::new(false),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            raw_taps: Arc::new(RawTapRegistry::default()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            pane_shell_argv: None,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -5470,11 +6047,14 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            content_lock_held: Cell::new(false),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            raw_taps: Arc::new(RawTapRegistry::default()),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            pane_shell_argv: None,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -5899,6 +6479,240 @@ mod tests {
             argv: None,
             cmdline: None,
         }
+    }
+
+    #[test]
+    fn foreground_process_info_prefers_group_leader() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(100, "less"),
+                foreground_process(99, "git"),
+            ],
+        };
+        let info = foreground_process_info(&job, 42, None).unwrap();
+        assert_eq!(info.name, "git");
+        assert!(!info.is_shell);
+
+        let leaderless = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(100, "less"),
+                foreground_process(101, "cat"),
+            ],
+        };
+        assert_eq!(
+            foreground_process_info(&leaderless, 42, None).unwrap().name,
+            "less"
+        );
+
+        let empty = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: Vec::new(),
+        };
+        assert_eq!(foreground_process_info(&empty, 42, None), None);
+    }
+
+    fn shell_pid_job(name: &str, argv: Option<&[&str]>) -> crate::platform::ForegroundJob {
+        crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv: argv.map(|argv| argv.iter().map(|arg| arg.to_string()).collect()),
+                ..foreground_process(42, name)
+            }],
+        }
+    }
+
+    #[test]
+    fn foreground_process_info_marks_pane_shell_at_prompt() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv0: Some("-zsh".into()),
+                argv: Some(vec!["-zsh".into()]),
+                ..foreground_process(42, "zsh")
+            }],
+        };
+        let login_zsh = ["-zsh".to_string()];
+        let info = foreground_process_info(&job, 42, Some(&login_zsh)).unwrap();
+        assert_eq!(info.name, "zsh");
+        assert_eq!(info.argv, vec!["-zsh".to_string()]);
+        assert!(info.is_shell);
+
+        let is_shell = |name: &str, argv: &[&str], launch: &[&str]| {
+            let launch: Vec<String> = launch.iter().map(|arg| arg.to_string()).collect();
+            foreground_process_info(&shell_pid_job(name, Some(argv)), 42, Some(&launch))
+                .unwrap()
+                .is_shell
+        };
+        // An unchanged launch argv stays at a prompt even with operand-style args.
+        let fish = ["fish", "--init-command", "x"];
+        assert!(is_shell("fish", &fish, &fish));
+        // After an `exec`, only an operand-free shell argv counts.
+        assert!(is_shell("zsh", &["zsh"], &["-bash"]));
+        assert!(!is_shell("bash", &["bash", "build.sh"], &["-bash"]));
+        assert!(!is_shell("fish", &["fish", "--init-command", "y"], &fish));
+    }
+
+    #[test]
+    fn command_builder_exec_argv_matches_portable_pty_exec() {
+        let mut cmd = CommandBuilder::new("fish");
+        cmd.args(["--init-command", "x"]);
+        assert_eq!(
+            command_builder_exec_argv(&cmd),
+            Some(vec!["fish".into(), "--init-command".into(), "x".into()])
+        );
+
+        #[cfg(unix)]
+        {
+            let mut login = CommandBuilder::new_default_prog();
+            login.env("SHELL", "/bin/sh");
+            assert_eq!(
+                command_builder_exec_argv(&login),
+                Some(vec!["-sh".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_process_info_rejects_non_shell_child_pid() {
+        let exec_htop = shell_pid_job("htop", Some(&["htop"]));
+        let info = foreground_process_info(&exec_htop, 42, Some(&["-bash".to_string()])).unwrap();
+        assert_eq!(info.name, "htop");
+        assert!(!info.is_shell);
+
+        let argv_htop = shell_pid_job("htop", Some(&["htop", "-d", "5"]));
+        let info = foreground_process_info(&argv_htop, 42, None).unwrap();
+        assert_eq!(info.name, "htop");
+        assert!(!info.is_shell);
+    }
+
+    #[test]
+    fn foreground_process_info_requires_shell_without_operands_for_commands() {
+        let is_shell = |name: &str, argv: Option<&[&str]>| {
+            foreground_process_info(&shell_pid_job(name, argv), 42, None)
+                .unwrap()
+                .is_shell
+        };
+        assert!(!is_shell("bash", Some(&["bash", "build.sh"])));
+        assert!(!is_shell("sh", Some(&["sh", "-c", "htop"])));
+        assert!(!is_shell("zsh", None));
+        assert!(is_shell("zsh", Some(&["zsh"])));
+        assert!(is_shell("zsh", Some(&["/bin/zsh", "-l"])));
+        assert!(is_shell("zsh", Some(&["-zsh"])));
+
+        // A shell the pane's shell started is a job, not the pane at a prompt.
+        let subshell = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv: Some(vec!["bash".into()]),
+                ..foreground_process(99, "bash")
+            }],
+        };
+        assert!(
+            !foreground_process_info(&subshell, 42, Some(&["bash".to_string()]))
+                .unwrap()
+                .is_shell
+        );
+    }
+
+    #[test]
+    fn foreground_process_name_normalizes_paths_and_login_dashes() {
+        let with = |argv0: Option<&str>, argv: Option<Vec<&str>>, name: &str| {
+            foreground_process_name(&crate::platform::ForegroundProcess {
+                argv0: argv0.map(str::to_string),
+                argv: argv.map(|argv| argv.into_iter().map(str::to_string).collect()),
+                ..foreground_process(7, name)
+            })
+        };
+        assert_eq!(with(Some("-zsh"), None, "zsh"), "zsh");
+        assert_eq!(with(Some("/usr/bin/htop"), None, "htop"), "htop");
+        assert_eq!(
+            with(None, Some(vec!["/usr/bin/htop", "-d", "5"]), "htop"),
+            "htop"
+        );
+        assert_eq!(with(None, Some(vec!["-bash"]), "bash"), "bash");
+        assert_eq!(with(None, None, "-fish"), "fish");
+        assert_eq!(with(Some(""), Some(vec![""]), "nvim"), "nvim");
+        assert_eq!(with(Some("-"), None, "nu"), "nu");
+    }
+
+    #[test]
+    fn foreground_process_info_caps_argv() {
+        let long_arg = format!("{}é", "a".repeat(FOREGROUND_PROCESS_MAX_ARG_BYTES - 1));
+        let mut argv = vec!["nvim".to_string(), long_arg];
+        argv.extend((0..30).map(|index| format!("file{index}")));
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![crate::platform::ForegroundProcess {
+                argv: Some(argv),
+                ..foreground_process(99, "nvim")
+            }],
+        };
+        let info = foreground_process_info(&job, 42, None).unwrap();
+        assert_eq!(info.argv.len(), FOREGROUND_PROCESS_MAX_ARGS);
+        assert_eq!(info.argv[0], "nvim");
+        // The two-byte 'é' straddles the limit, so it is dropped whole.
+        assert_eq!(
+            info.argv[1],
+            "a".repeat(FOREGROUND_PROCESS_MAX_ARG_BYTES - 1)
+        );
+        assert_eq!(info.argv[15], "file13");
+    }
+
+    #[test]
+    fn process_probe_carries_foreground_process_for_unidentified_jobs() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "htop")],
+        };
+        let result =
+            probe_foreground_process_from_jobs(42, Some(99), None, || Some(job.clone()), |_| None);
+        assert_eq!(result.agent, None);
+        assert_eq!(result.foreground_job.as_ref(), Some(&job));
+        let published = published_foreground_process(&result, 42, Some(&["-bash".to_string()]));
+        if cfg!(windows) {
+            assert_eq!(published, None);
+        } else {
+            let info = published.unwrap();
+            assert_eq!(info.name, "htop");
+            assert!(!info.is_shell);
+        }
+
+        let missing = probe_foreground_process_from_jobs(42, None, None, || None, |_| None);
+        assert_eq!(
+            published_foreground_process(&missing, 42, Some(&["-bash".to_string()])),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_process_publishes_only_changes() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let pane_id = PaneId::from_raw(1);
+        let htop = foreground_process_info(
+            &crate::platform::ForegroundJob {
+                process_group_id: 99,
+                processes: vec![foreground_process(99, "htop")],
+            },
+            42,
+            None,
+        );
+        let mut last = None;
+        publish_foreground_process(&tx, pane_id, None, &mut last).await;
+        publish_foreground_process(&tx, pane_id, None, &mut last).await;
+        publish_foreground_process(&tx, pane_id, htop.clone(), &mut last).await;
+        publish_foreground_process(&tx, pane_id, htop.clone(), &mut last).await;
+        drop(tx);
+
+        let mut published = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let AppEvent::ForegroundProcessChanged { process, .. } = event else {
+                panic!("unexpected event");
+            };
+            published.push(process);
+        }
+        assert_eq!(published, vec![None, htop]);
     }
 
     #[test]

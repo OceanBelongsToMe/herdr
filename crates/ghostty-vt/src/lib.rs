@@ -1288,6 +1288,16 @@ impl Terminal {
         Ok((wide, graphemes))
     }
 
+    pub fn screen_row_wrap(&self, y: u32) -> Result<bool, Error> {
+        let grid_ref = self.grid_ref(ghostty_screen_point(0, y))?;
+        Ok(grid_ref_wrap_state(&grid_ref)?.0)
+    }
+
+    pub fn screen_cell_wide(&self, x: u16, y: u32) -> Result<CellWide, Error> {
+        let grid_ref = self.grid_ref(ghostty_screen_point(x, y))?;
+        grid_ref_wide(&grid_ref)
+    }
+
     pub fn screen_text_rows(&self) -> Result<Vec<ScreenTextRow>, Error> {
         self.screen_text_rows_range(0, usize::MAX)
     }
@@ -1623,6 +1633,162 @@ impl Terminal {
         )
     }
 
+    pub fn keyboard_state_ansi(&self) -> Result<String, Error> {
+        self.format_keyboard_state_ansi(false)
+    }
+
+    pub fn kitty_keyboard_state_ansi(&self) -> Result<String, Error> {
+        self.format_keyboard_state_ansi(true)
+    }
+
+    fn format_keyboard_state_ansi(&self, kitty_keyboard: bool) -> Result<String, Error> {
+        self.format_state_ansi(ffi::GhosttyFormatterTerminalExtra {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            keyboard: true,
+            screen: ffi::GhosttyFormatterScreenExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                kitty_keyboard,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    /// Replayable VT for the state a raw attach must carry beyond modes:
+    /// scrolling regions, tab stops, charsets, and the pen (active SGR,
+    /// hyperlink, and protection). Keyboard protocols come from the pane's
+    /// tracker, which knows the pushed Kitty stack.
+    pub fn raw_attach_state_ansi(&self) -> Result<String, Error> {
+        // Extras omit default hyperlink, protection, and charset state. Clear
+        // stale state when reusing a client terminal, then apply saved extras.
+        // HTS positions are absolute columns, so origin mode must be off while
+        // the formatter restores tabstops, even with active scrolling margins.
+        let mut ansi =
+            String::from("\x1b[?6l\x1b]8;;\x1b\\\x1b[0\"q\x1b(B\x1b)B\x1b*B\x1b+B\x0f\x1b}");
+        ansi.push_str(
+            &self.format_state_only_ansi(ffi::GhosttyFormatterTerminalExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+                scrolling_region: true,
+                tabstops: true,
+                screen: ffi::GhosttyFormatterScreenExtra {
+                    size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                    style: true,
+                    hyperlink: true,
+                    protection: true,
+                    charsets: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })?,
+        );
+        if self.mode_get(6)? {
+            ansi.push_str("\x1b[?6h");
+        }
+        Ok(ansi)
+    }
+
+    /// Format one cell with and without extras and remove the cell. Tabstop
+    /// setup precedes content; the remaining requested extras follow it.
+    fn format_state_only_ansi(
+        &self,
+        extra: ffi::GhosttyFormatterTerminalExtra,
+    ) -> Result<String, Error> {
+        let mut cell = ffi::GhosttyGridRef {
+            size: mem::size_of::<ffi::GhosttyGridRef>(),
+            ..Default::default()
+        };
+        unsafe {
+            ffi::ghostty_terminal_grid_ref(self.raw, ghostty_viewport_point(0, 0), &mut cell)
+                .into_result()?;
+        }
+        let selection = ffi::GhosttySelection {
+            size: mem::size_of::<ffi::GhosttySelection>(),
+            start: cell,
+            end: cell,
+            rectangle: false,
+        };
+        let with_state = self.format_terminal_vt(&selection, extra)?;
+        let content_only = self.format_terminal_vt(
+            &selection,
+            ffi::GhosttyFormatterTerminalExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+                screen: ffi::GhosttyFormatterScreenExtra {
+                    size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?;
+        let (prefix, content_and_state) = if extra.tabstops {
+            // The tabstop prefix contains only CSI 3 g, CSI n G, and HTS,
+            // followed by this home command. Never search for the cell text:
+            // it could also occur inside an escape sequence.
+            let end = with_state
+                .find("\x1b[H")
+                .ok_or(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))?
+                + "\x1b[H".len();
+            with_state.split_at(end)
+        } else {
+            ("", with_state.as_str())
+        };
+        let state = content_and_state
+            .strip_prefix(content_only.as_str())
+            .ok_or(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))?;
+        Ok(format!("{prefix}{state}"))
+    }
+
+    fn format_state_ansi(
+        &self,
+        extra: ffi::GhosttyFormatterTerminalExtra,
+    ) -> Result<String, Error> {
+        self.format_terminal_vt(ptr::null(), extra)
+    }
+
+    fn format_terminal_vt(
+        &self,
+        selection: *const ffi::GhosttySelection,
+        extra: ffi::GhosttyFormatterTerminalExtra,
+    ) -> Result<String, Error> {
+        let mut formatter: ffi::GhosttyFormatter = ptr::null_mut();
+        let options = ffi::GhosttyFormatterTerminalOptions {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalOptions>(),
+            emit: FormatterFormat::Vt.as_raw(),
+            unwrap: false,
+            trim: false,
+            extra,
+            selection,
+        };
+        unsafe {
+            ffi::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.raw, options)
+                .into_result()?;
+        }
+
+        let mut out_ptr = ptr::null_mut();
+        let mut out_len = 0usize;
+        let result = unsafe {
+            ffi::ghostty_formatter_format_alloc(formatter, ptr::null(), &mut out_ptr, &mut out_len)
+        };
+        unsafe {
+            ffi::ghostty_formatter_free(formatter);
+        }
+        result.into_result()?;
+
+        let text = if out_len == 0 {
+            String::new()
+        } else {
+            let bytes = unsafe { slice::from_raw_parts(out_ptr.cast_const(), out_len) };
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+
+        if !out_ptr.is_null() {
+            unsafe {
+                ffi::ghostty_free(ptr::null(), out_ptr, out_len);
+            }
+        }
+
+        Ok(text)
+    }
+
     fn read_formatted_selection(
         &self,
         start: ffi::GhosttyPoint,
@@ -1755,6 +1921,66 @@ impl Terminal {
 
     pub fn cursor_y(&self) -> Result<u16, Error> {
         self.get_u16(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_Y)
+    }
+
+    /// Cursor column in the active area, independent of the viewport.
+    pub fn cursor_x(&self) -> Result<u16, Error> {
+        self.get_u16(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_X)
+    }
+
+    /// DECTCEM visibility of the active cursor, independent of the viewport.
+    pub fn cursor_visible(&self) -> Result<bool, Error> {
+        self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_VISIBLE)
+    }
+
+    /// Whether the next printable soft-wraps: the last print landed on the
+    /// final column.
+    pub fn cursor_pending_wrap(&self) -> Result<bool, Error> {
+        self.get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_PENDING_WRAP)
+    }
+
+    /// Active-area cells `start_x..=end_x` on one row as styled VT.
+    pub fn cell_ansi(&self, start_x: u16, end_x: u16, y: u16) -> Result<String, Error> {
+        self.read_formatted_selection(
+            ghostty_active_point(start_x, u32::from(y)),
+            ghostty_active_point(end_x, u32::from(y)),
+            false,
+            FormatterFormat::Vt,
+            false,
+            false,
+        )
+    }
+
+    /// The wide property of one active-area cell.
+    pub fn cell_wide(&self, x: u16, y: u16) -> Result<CellWide, Error> {
+        let mut cell = ffi::GhosttyGridRef {
+            size: mem::size_of::<ffi::GhosttyGridRef>(),
+            ..Default::default()
+        };
+        unsafe {
+            ffi::ghostty_terminal_grid_ref(
+                self.raw,
+                ghostty_active_point(x, u32::from(y)),
+                &mut cell,
+            )
+            .into_result()?;
+        }
+        grid_ref_wide(&cell)
+    }
+
+    /// The pen alone: SGR, hyperlink, and protection state.
+    pub fn pen_ansi(&self) -> Result<String, Error> {
+        self.format_state_only_ansi(ffi::GhosttyFormatterTerminalExtra {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            screen: ffi::GhosttyFormatterScreenExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                style: true,
+                hyperlink: true,
+                protection: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
     }
 
     pub fn effective_foreground_color(&self) -> Result<Option<RgbColor>, Error> {
@@ -2311,6 +2537,15 @@ impl Drop for Terminal {
             ffi::ghostty_tracked_grid_ref_free(self.tracked_row);
             ffi::ghostty_terminal_free(self.raw);
         }
+    }
+}
+
+fn ghostty_active_point(x: u16, y: u32) -> ffi::GhosttyPoint {
+    ffi::GhosttyPoint {
+        tag: ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+        value: ffi::GhosttyPointValue {
+            coordinate: ffi::GhosttyPointCoordinate { x, y },
+        },
     }
 }
 

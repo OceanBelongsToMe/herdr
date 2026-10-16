@@ -272,3 +272,84 @@ verification:
 (cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='cursorAbsolute keeps the hyperlink when style migration splits the page')
 just maintenance-test
 ```
+
+## 0003 reset style before empty cell gaps
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0003-reset-style-before-empty-cell-gaps.patch`
+
+herdr issue: none; reported during local fork control-mode restore testing
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/src/terminal/formatter.zig`
+
+reason: When formatting untouched cells between a styled label and later text,
+the formatter emitted spaces before closing the label's style. Replaying a
+control-mode snapshot consequently extended background colors and attributes
+across the gap. Close the previous style before emitting default-style blanks,
+while preserving explicitly styled spaces and output coordinate mapping. The
+style-run fast path yields when pending gaps need a default-style reset, and
+the interned style ID resets alongside the current style so later text can
+restore the same style correctly.
+
+remove when: the vendored formatter resets the previous style before emitting
+accumulated default-style blanks, and both the formatter and rendered snapshot
+replay regressions pass without this patch.
+
+verification (Zig 0.16.0):
+
+```sh
+cd vendor/libghostty-vt
+zig build test-lib-vt -Demit-lib-vt -Dtest-filter=formatter -Demit-xcframework=false -Dversion-string=1.3.2-HEAD-+44f2a44df
+cd ../..
+just test-one raw_snapshot
+python3 -m unittest scripts.test_vendor_libghostty_vt
+```
+
+
+## 0009 preserve background-only rows in styled output
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0009-preserve-background-only-rows.patch`
+
+herdr issue: none; reported during local fork control-mode restoration of Codex output
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/src/terminal/formatter.zig`
+
+reason: The formatter skipped rows containing no text, including rows filled
+with palette or RGB backgrounds by terminal erase operations. Raw control-mode
+snapshots consequently lost the fill although direct cell rendering remained
+correct. Classify styled rows using the same content/styling rules as the cell
+loop, restricted to the selected columns; keep plaintext blank-row behavior.
+The scan remains linear and adds no per-cell allocations or presentation work.
+
+remove when: the vendored formatter preserves background-only and styled empty
+rows, and both the formatter and rendered snapshot replay regressions pass
+without this patch.
+
+verification (Zig 0.16.0; set ZIG to that executable for Rust builds):
+
+```sh
+cd vendor/libghostty-vt
+zig build test-lib-vt -Demit-lib-vt -Dtest-filter=formatter -Demit-xcframework=false -Dversion-string=1.3.2-HEAD-+44f2a44df
+cd ../..
+just test-one raw_snapshot
+python3 -m unittest scripts.test_vendor_libghostty_vt
+```

@@ -17,6 +17,7 @@ mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
+mod foreground_process;
 mod git_refresh;
 mod ids;
 mod popup;
@@ -24,7 +25,7 @@ mod runtime;
 mod session;
 pub mod state;
 mod tab_bar_status;
-mod terminal_targets;
+pub(crate) mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
 mod window_title;
@@ -494,6 +495,10 @@ impl App {
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            control_chromeless_tabs: std::collections::HashSet::new(),
+            control_geometry_tabs: std::collections::HashSet::new(),
+            control_pane_geometry: std::collections::HashMap::new(),
+            control_tab_geometry_controllers: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
@@ -1561,6 +1566,14 @@ mod tests {
         assert_eq!(app.state.palette.text, ratatui::style::Color::Rgb(4, 5, 6));
     }
 
+    fn future_release_version() -> String {
+        if crate::build_info::channel() == "rootshell" {
+            format!("{}-rootshell.99.99.99", crate::build_info::BASE_VERSION)
+        } else {
+            "99.99.99".into()
+        }
+    }
+
     #[test]
     fn startup_restores_preview_update_available_from_saved_notes() {
         let _guard = config_env_lock().lock().unwrap();
@@ -1568,18 +1581,19 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         // Use a bogus far-future version so preview=true regardless of current binary version.
-        crate::release_notes::save_pending("99.99.99", "### Changed\n- One").unwrap();
+        let future = future_release_version();
+        crate::release_notes::save_pending(&future, "### Changed\n- One").unwrap();
 
         let app = test_app();
 
-        assert_eq!(app.state.update_available.as_deref(), Some("99.99.99"));
+        assert_eq!(app.state.update_available.as_deref(), Some(future.as_str()));
         assert!(app.state.latest_release_notes_available);
         assert_eq!(
             app.state
                 .latest_release_notes
                 .as_ref()
                 .map(|notes| notes.version.as_str()),
-            Some("99.99.99")
+            Some(future.as_str())
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -1594,9 +1608,10 @@ mod tests {
         let mut app = test_app();
         assert!(app.state.latest_release_notes.is_none());
 
-        crate::release_notes::save_pending("99.99.99", "### Changed\n- One").unwrap();
+        let future = future_release_version();
+        crate::release_notes::save_pending(&future, "### Changed\n- One").unwrap();
         app.handle_internal_event(AppEvent::UpdateReady {
-            version: "99.99.99".into(),
+            version: future.clone(),
             install_command: "herdr update".into(),
         });
 
@@ -1606,7 +1621,7 @@ mod tests {
                 notes.body.as_str(),
                 notes.preview
             )),
-            Some(("99.99.99", "### Changed\n- One", true))
+            Some((future.as_str(), "### Changed\n- One", true))
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -1639,10 +1654,10 @@ mod tests {
             stored["show_on_startup"].as_bool()
         };
 
-        let current = env!("CARGO_PKG_VERSION");
-        crate::release_notes::save_pending(current, "### Changed\n- Current").unwrap();
+        let current = crate::build_info::version();
+        crate::release_notes::save_pending(&current, "### Changed\n- Current").unwrap();
         let mut app = test_app();
-        dismiss(&mut app, current);
+        dismiss(&mut app, &current);
         assert_eq!(show_on_startup(), Some(false));
 
         crate::release_notes::save_pending("99.99.99", "### Changed\n- Preview").unwrap();
@@ -1677,7 +1692,7 @@ mod tests {
         let path = temp_config_path("startup-pending-release-notes-no-auto-open");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
-        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
+        crate::release_notes::save_pending(&crate::build_info::version(), "### Changed\n- One")
             .unwrap();
         let config = Config {
             onboarding: Some(false),
@@ -1712,7 +1727,7 @@ mod tests {
         crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
             .unwrap();
         crate::product_announcements::save_manifest_announcement(
-            env!("CARGO_PKG_VERSION"),
+            &crate::build_info::version(),
             Some(&crate::product_announcements::ManifestAnnouncement {
                 id: "startup-announcement".into(),
                 title: Some("Startup announcement".into()),

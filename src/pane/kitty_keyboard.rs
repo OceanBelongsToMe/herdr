@@ -127,7 +127,6 @@ impl KittyKeyboardTracker {
         }
     }
 
-    #[cfg(unix)]
     pub(crate) fn replay_ansi(&self) -> Option<String> {
         let mut ansi = String::new();
         if self.stack.is_empty() {

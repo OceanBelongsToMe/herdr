@@ -507,6 +507,8 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_process: Option<ForegroundProcessInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -531,6 +533,17 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ForegroundProcessInfo {
+    /// Basename of the foreground job leader, without a login shell's leading `-`.
+    pub name: String,
+    /// Leading arguments, including argv[0], capped in count and per-argument length.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+    /// True when the foreground job is the pane's own shell, i.e. at a prompt.
+    pub is_shell: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -648,6 +661,34 @@ pub struct PaneLayoutSnapshot {
     pub focused_pane_id: String,
     pub panes: Vec<PaneLayoutPane>,
     pub splits: Vec<PaneLayoutSplit>,
+    /// Who sizes this tab. Absent on servers without geometry ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_controller: Option<GeometryController>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GeometryControllerKind {
+    /// A control stream owns the tab's geometry.
+    Control,
+    /// A Herdr client (TUI or endpoint shell) owns it.
+    Client,
+    /// Nobody claimed it; the tab follows the shared view area.
+    #[default]
+    None,
+}
+
+/// The connection that sizes a tab, and the chrome it asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct GeometryController {
+    pub kind: GeometryControllerKind,
+    /// Connection id for `control`, client id for `client`, absent for `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<u64>,
+    #[serde(default)]
+    pub chrome: super::terminal::TabChrome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -663,6 +704,9 @@ pub struct PaneLayoutPane {
     pub pane_id: String,
     pub focused: bool,
     pub rect: PaneLayoutRect,
+    /// Actual terminal grid, when it differs from the tab's layout units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<super::terminal::PaneTerminalSize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

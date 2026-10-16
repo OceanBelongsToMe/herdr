@@ -23,6 +23,7 @@ use crate::ipc::{
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 
+pub(crate) mod control_stream;
 #[cfg(test)]
 mod subscription_socket_tests;
 
@@ -67,7 +68,7 @@ pub(crate) fn start_server_with_stop_control(
     start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
 }
 
-fn default_capabilities() -> Option<ServerCapabilities> {
+pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
@@ -75,6 +76,12 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        terminal_control_stream: crate::api::control::CONTROL_STREAM_PROTOCOL,
+        control_features: crate::api::control::CONTROL_FEATURES
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect(),
+        server_pid: Some(std::process::id()),
     })
 }
 
@@ -424,6 +431,29 @@ fn handle_connection_with_stop(
                 }
             }
             Ok(())
+        }
+        Method::ControlOpen(params) => {
+            let result = control_stream::serve(
+                stream,
+                request_id.clone(),
+                params,
+                api_tx,
+                event_hub,
+                running,
+                capabilities,
+            );
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "stream_closed",
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
         }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
@@ -954,6 +984,14 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
     )
 }
 
+pub(super) fn dispatch_to_app_with_control(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    control: crate::api::control::ControlConnectionHandle,
+) -> String {
+    dispatch_to_app_inner(request, api_tx, None, None, None, Some(control))
+}
+
 fn dispatch_to_app(
     request: Request,
     api_tx: &ApiRequestSender,
@@ -961,12 +999,31 @@ fn dispatch_to_app(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     timeout_response: Option<(&str, &str)>,
 ) -> String {
+    dispatch_to_app_inner(
+        request,
+        api_tx,
+        timeout,
+        response_write_complete,
+        timeout_response,
+        None,
+    )
+}
+
+fn dispatch_to_app_inner(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    timeout_response: Option<(&str, &str)>,
+    control: Option<crate::api::control::ControlConnectionHandle>,
+) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         respond_to,
         response_write_complete,
+        control,
     }) {
         return error_response_json(
             request_id,
@@ -1143,6 +1200,7 @@ mod tests {
             focused: true,
             cwd: None,
             foreground_cwd: None,
+            foreground_process: None,
             restore_error: None,
             label: None,
             agent: Some("pi".into()),
@@ -1397,6 +1455,9 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_control_stream: 0,
+                control_features: Vec::new(),
+                server_pid: None,
             }),
             None,
             None,
